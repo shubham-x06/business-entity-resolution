@@ -1,0 +1,15 @@
+# ------------------------------------------------------------------
+# blocking.yaml  –  Candidate-generation / blocking configuration
+# ------------------------------------------------------------------
+
+minhash_lsh:
+  num_perm: 128           # Number of MinHash permutation functions
+  threshold: 0.3          # Jaccard similarity threshold for LSH
+  ngram_size: 3           # Character n-gram size for shingling
+
+name_blocking:
+  enabled: true
+  prefix_len: 4           # First-N-chars exact-match blocking key
+
+country_blocking:
+  enabled: true           # Only pair records from the same country

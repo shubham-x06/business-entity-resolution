@@ -1,0 +1,23 @@
+# ------------------------------------------------------------------
+# paths.yaml  –  File-system paths used by the pipeline
+# ------------------------------------------------------------------
+
+data:
+  train:
+    source1: "dataset/train/train_source1.tsv"
+    source2: "dataset/train/train_source2.tsv"
+    source3: "dataset/train/train_source3.tsv"
+    ground_truth: "dataset/train/train_ground_truth.tsv"
+  test:
+    source1: "dataset/test/test_source1.tsv"
+    source2: "dataset/test/test_source2.tsv"
+    source3: "dataset/test/test_source3.tsv"
+
+output:
+  dir: "output"
+  matching_results: "output/matching_results.tsv"
+  candidate_pairs: "output/candidate_pairs.tsv"
+
+model:
+  dir: "models"
+  artifact: "models/lgbm_entity_model.txt"
