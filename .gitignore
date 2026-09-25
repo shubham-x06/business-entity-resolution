@@ -1,0 +1,20 @@
+# Large datasets
+dataset/
+
+# Training outputs
+checkpoints/
+experiments/
+output/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
