@@ -3,7 +3,8 @@ dataset/
 
 # Training outputs
 checkpoints/
-experiments/
+experiments/*
+!experiments/eda_report.md
 output/
 
 # Python
