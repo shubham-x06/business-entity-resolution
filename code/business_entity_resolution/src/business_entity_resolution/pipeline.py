@@ -65,7 +65,7 @@ def _run_stage(
 ) -> StageResult:
     """Execute a pipeline stage with timing and graceful error handling.
 
-    Catches ``NotImplementedError`` and ``AttributeError`` (the two errors
+    Catches ``NotImplementedError`` and ``ImportError`` (the two errors
     raised by unimplemented stubs or missing functions) and logs a clear
     skip message.  All other exceptions propagate.
 
@@ -91,7 +91,7 @@ def _run_stage(
             "Stage [%s] — COMPLETED (%.2fs)", name, elapsed,
         )
         return StageResult(name, "completed", elapsed, result=result)
-    except (NotImplementedError, AttributeError) as exc:
+    except (NotImplementedError, ImportError) as exc:
         elapsed = time.time() - t0
         msg = f"{type(exc).__name__}: {exc}"
         logger.warning(

@@ -184,14 +184,14 @@ class TestRunStage:
         assert sr.result is None
         assert "NotImplementedError" in sr.error_msg
 
-    def test_attribute_error_stage(self):
-        """Stage raising AttributeError returns status='skipped'."""
-        def bad_attr():
-            raise AttributeError("module has no attribute 'foo'")
+    def test_import_error_stage(self):
+        """Stage raising ImportError returns status='skipped'."""
+        def bad_import():
+            import non_existent_module
 
-        sr = _run_stage("test_attr", bad_attr)
+        sr = _run_stage("test_import", bad_import)
         assert sr.status == "skipped"
-        assert "AttributeError" in sr.error_msg
+        assert "ImportError" in sr.error_msg or "ModuleNotFoundError" in sr.error_msg
 
     def test_other_exception_propagates(self):
         """Stage raising an unexpected exception should propagate."""
