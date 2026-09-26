@@ -78,6 +78,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional identifier for this experiment run.",
     )
+    parser.add_argument(
+        "--country",
+        type=str,
+        default=None,
+        help="Optional country filter ('India', 'US'). Restricts feature extraction to S1 entities from that country.",
+    )
+    parser.add_argument(
+        "--max-pairs",
+        type=int,
+        default=None,
+        help="Maximum candidate pairs to process in feature extraction (for sampling/benchmarking).",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=100000,
+        help="Chunk size (number of candidate pairs) per feature extraction batch. Default: 100,000.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output destination path (.parquet or .tsv) for extracted features.",
+    )
     return parser.parse_args(argv)
 
 
@@ -198,13 +222,74 @@ def run_blocking_stage(
     }
 
 
+def run_features_stage(
+    root: Path,
+    country: str | None = None,
+    max_pairs: int | None = None,
+    chunk_size: int = 100000,
+    output_path: Path | None = None,
+    run_id: str | None = None,
+) -> Dict[str, Any]:
+    """Execute Stage 2: Vectorized chunked pairwise feature extraction."""
+    from business_entity_resolution.features import (
+        load_and_normalize_entity_cache,
+        extract_features_streaming,
+    )
+
+    cand_path = root / "output" / "candidate_pairs.tsv"
+    c_tag = country.lower() if country else "all"
+    out = output_path or (root / "output" / f"features_{c_tag}.parquet")
+
+    print(f"\n[features] Loading and normalizing entity cache (country={country or 'ALL'})...")
+    entity_cache, vectorizer = load_and_normalize_entity_cache(
+        root=root,
+        country_filter=country,
+    )
+
+    print(f"[features] Streaming candidate pairs: {cand_path} -> {out}")
+    print(f"[features] Chunk size: {chunk_size:,} | Max pairs: {max_pairs or 'ALL'}")
+
+    stats = extract_features_streaming(
+        candidate_pairs_path=cand_path,
+        entity_cache=entity_cache,
+        output_path=out,
+        country_filter=country,
+        vectorizer=vectorizer,
+        chunk_size=chunk_size,
+        max_pairs=max_pairs,
+    )
+
+    print("\n" + "=" * 60)
+    print("FEATURE EXTRACTION STAGE REPORT")
+    print("=" * 60)
+    print(f"Country Filter:        {country or 'ALL'}")
+    print(f"Total Pairs Processed: {stats['total_pairs']:,}")
+    print(f"S1 Entities Processed: {stats['total_s1_entities']:,}")
+    print(f"Elapsed Time:          {stats['elapsed_seconds']:.2f} s")
+    print(f"Processing Speed:      {stats['pairs_per_sec']:,.0f} pairs/sec")
+    print(f"Peak Memory Usage:     {stats['peak_memory_mb']:.1f} MB")
+    print(f"Output File:           {stats['output_path']}")
+
+    total_440m = 440091505
+    if stats["pairs_per_sec"] > 0:
+        est_full_sec = total_440m / stats["pairs_per_sec"]
+        print(f"Extrapolated Full 440M Runtime: {est_full_sec / 60.0:.1f} minutes ({est_full_sec / 3600.0:.2f} hours)")
+    print("=" * 60 + "\n")
+
+    return stats
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry-point for the training pipeline."""
     args = parse_args(argv)
     print(f"[run_train] root = {args.root}")
     print(f"[run_train] stage = {args.stage}")
+    if args.country:
+        print(f"[run_train] country = {args.country}")
     if args.sample:
         print(f"[run_train] sample = {args.sample}")
+    if args.max_pairs:
+        print(f"[run_train] max_pairs = {args.max_pairs}")
     if args.run_id:
         print(f"[run_train] run_id = {args.run_id}")
 
@@ -219,7 +304,14 @@ def main(argv: list[str] | None = None) -> None:
             return
 
     if args.stage in ("features", "all"):
-        print("[run_train] Stage 'features' not yet implemented (Milestone 6).")
+        run_features_stage(
+            root=args.root,
+            country=args.country,
+            max_pairs=args.max_pairs,
+            chunk_size=args.chunk_size,
+            output_path=args.output,
+            run_id=args.run_id,
+        )
         if args.stage == "features":
             return
 
