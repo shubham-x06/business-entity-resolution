@@ -58,7 +58,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--stage",
         choices=["all", "blocking", "features", "train", "model", "eval", "threshold-tuning"],
         default="all",
-        help="Which pipeline stage to execute. Default: 'all'.",
+        help="Which pipeline stage to execute. 'all' runs the full orchestrated pipeline. Default: 'all'.",
     )
     parser.add_argument(
         "--val-ratio",
@@ -250,6 +250,7 @@ def run_blocking_stage(
     }
 
 
+<<<<<<< HEAD
 def run_features_stage(
     root: Path,
     country: str | None = None,
@@ -871,6 +872,37 @@ def run_threshold_tuning_stage(
     print("=" * 60 + "\n")
 
     return report
+
+
+def run_full_pipeline(root: Path, sample: int | None = None) -> Dict[str, Any]:
+    """Execute the full orchestrated training pipeline.
+
+    Loads all configs and calls ``pipeline.run_train_pipeline``.
+    """
+    from business_entity_resolution.io_utils import load_config
+    from business_entity_resolution.pipeline import run_train_pipeline
+
+    cfg_dir = root / "code" / "business_entity_resolution" / "configs"
+    paths_cfg = load_config(cfg_dir / "paths.yaml")
+    blocking_cfg = load_config(cfg_dir / "blocking.yaml")
+    model_cfg = load_config(cfg_dir / "model.yaml")
+
+    config = {
+        "root": str(root),
+        "paths": paths_cfg,
+        "blocking": blocking_cfg,
+        "model": model_cfg,
+        "sample": sample,
+    }
+
+    result = run_train_pipeline(config)
+
+    logger.info("Pipeline summary:")
+    logger.info("  Completed stages: %s", result["completed"])
+    logger.info("  Skipped stages:   %s", result["skipped"])
+    logger.info("  Total elapsed:    %.2fs", result["elapsed_total_seconds"])
+
+    return result
 
 
 def main(argv: list[str] | None = None) -> None:
