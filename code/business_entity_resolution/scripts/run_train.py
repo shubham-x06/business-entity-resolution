@@ -58,7 +58,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--stage",
         choices=["all", "blocking", "features", "train", "eval"],
         default="all",
-        help="Which pipeline stage to execute. Default: 'all'.",
+        help="Which pipeline stage to execute. 'all' runs the full orchestrated pipeline. Default: 'all'.",
     )
     parser.add_argument(
         "--root",
@@ -198,40 +198,73 @@ def run_blocking_stage(
     }
 
 
+def run_full_pipeline(root: Path, sample: int | None = None) -> Dict[str, Any]:
+    """Execute the full orchestrated training pipeline.
+
+    Loads all configs and calls ``pipeline.run_train_pipeline``.
+    """
+    from business_entity_resolution.io_utils import load_config
+    from business_entity_resolution.pipeline import run_train_pipeline
+
+    cfg_dir = root / "code" / "business_entity_resolution" / "configs"
+    paths_cfg = load_config(cfg_dir / "paths.yaml")
+    blocking_cfg = load_config(cfg_dir / "blocking.yaml")
+    model_cfg = load_config(cfg_dir / "model.yaml")
+
+    config = {
+        "root": str(root),
+        "paths": paths_cfg,
+        "blocking": blocking_cfg,
+        "model": model_cfg,
+        "sample": sample,
+    }
+
+    result = run_train_pipeline(config)
+
+    logger.info("Pipeline summary:")
+    logger.info("  Completed stages: %s", result["completed"])
+    logger.info("  Skipped stages:   %s", result["skipped"])
+    logger.info("  Total elapsed:    %.2fs", result["elapsed_total_seconds"])
+
+    return result
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry-point for the training pipeline."""
     args = parse_args(argv)
-    print(f"[run_train] root = {args.root}")
-    print(f"[run_train] stage = {args.stage}")
+    logger.info("root = %s", args.root)
+    logger.info("stage = %s", args.stage)
     if args.sample:
-        print(f"[run_train] sample = {args.sample}")
+        logger.info("sample = %d", args.sample)
     if args.run_id:
-        print(f"[run_train] run_id = {args.run_id}")
+        logger.info("run_id = %s", args.run_id)
 
     # Add src to sys.path so package imports resolve cleanly
     src_dir = args.root / "code" / "business_entity_resolution" / "src"
     if str(src_dir) not in sys.path:
         sys.path.insert(0, str(src_dir))
 
-    if args.stage in ("blocking", "all"):
+    # ── Full orchestrated pipeline ──────────────────────────────────
+    if args.stage == "all":
+        run_full_pipeline(args.root, sample=args.sample)
+        return
+
+    # ── Individual stage execution (original behavior) ──────────────
+    if args.stage == "blocking":
         run_blocking_stage(args.root, sample=args.sample, run_id=args.run_id)
-        if args.stage == "blocking":
-            return
+        return
 
-    if args.stage in ("features", "all"):
-        print("[run_train] Stage 'features' not yet implemented (Milestone 6).")
-        if args.stage == "features":
-            return
+    if args.stage == "features":
+        logger.info("Stage 'features' not yet implemented (Milestone 6).")
+        return
 
-    if args.stage in ("train", "all"):
-        print("[run_train] Stage 'train' not yet implemented (Milestone 7).")
-        if args.stage == "train":
-            return
+    if args.stage == "train":
+        logger.info("Stage 'train' not yet implemented (Milestone 7).")
+        return
 
-    if args.stage in ("eval", "all"):
-        print("[run_train] Stage 'eval' not yet implemented (Milestone 8).")
-        if args.stage == "eval":
-            return
+    if args.stage == "eval":
+        logger.info("Stage 'eval' not yet implemented (Milestone 8).")
+        return
 
 
 if __name__ == "__main__":
