@@ -12,6 +12,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     build-essential \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir uv
 
