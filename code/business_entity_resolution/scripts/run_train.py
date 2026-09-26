@@ -1,30 +1,42 @@
 #!/usr/bin/env python
 """
-run_train.py  –  CLI entry-point for the training pipeline.
+run_train.py  –  CLI entry-point for model training & evaluation.
 
 Usage
 -----
-    python scripts/run_train.py [--root ROOT] [--stage STAGE]
+    python scripts/run_train.py [--stage {all,blocking,features,train,eval}]
+                                [--root ROOT] [--sample N]
 
-Loads configs, runs normalisation → blocking → features → model training,
-and saves the trained model artifact.
+Stages
+------
+1. blocking : Generate candidate pairs from S1 × (S2 ∪ S3) using country-
+              partitioned multi-signal inverted index.
+              Writes output/candidate_pairs.tsv and computes candidate-set
+              reduction ratio + recall@K on train_ground_truth.tsv.
+2. features : Compute pairwise feature matrix from candidate pairs.
+3. train    : Train LightGBM ranker/classifier on features.
+4. eval     : Evaluate on validation set and log metrics.
+5. all      : Run stages 1 → 4 sequentially (default).
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
 import time
 from pathlib import Path
+from typing import Any, Dict
 
-# ── Ensure src/ is importable ───────────────────────────────────────
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_CODE_DIR = _SCRIPT_DIR.parent  # code/business_entity_resolution/
-_SRC_DIR = _CODE_DIR / "src"
-if str(_SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(_SRC_DIR))
+import pandas as pd
+
+# ── Logging setup ───────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("run_train")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -40,7 +52,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     argparse.Namespace
     """
     parser = argparse.ArgumentParser(
-        description="Train the entity-resolution model.",
+        description="Train the business-entity resolution model.",
+    )
+    parser.add_argument(
+        "--stage",
+        choices=["all", "blocking", "features", "train", "eval"],
+        default="all",
+        help="Which pipeline stage to execute. Default: 'all'.",
     )
     parser.add_argument(
         "--root",
@@ -49,52 +67,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Repository root (student_resource/).  Default: auto-detected.",
     )
     parser.add_argument(
-        "--stage",
-        type=str,
+        "--sample",
+        type=int,
         default=None,
-        choices=["blocking", "features", "model", "all"],
-        help="Run a single pipeline stage.  Default: all.",
+        help="Subsample N rows from Source 1 for fast prototyping.",
     )
     parser.add_argument(
         "--run-id",
         type=str,
         default=None,
-        help="Experiment run ID (for output directory naming).",
-    )
-    parser.add_argument(
-        "--sample",
-        type=int,
-        default=None,
-        help="Sample N rows from Source 1 for fast pipeline validation.",
+        help="Optional identifier for this experiment run.",
     )
     return parser.parse_args(argv)
 
 
+# ── Stage runners ───────────────────────────────────────────────────
+
 def run_blocking_stage(
     root: Path,
-    run_id: str | None = None,
     sample: int | None = None,
-) -> dict:
-    """Run the blocking stage: generate candidate pairs and evaluate recall.
-
-    Parameters
-    ----------
-    root : Path
-        Repository root.
-    run_id : str | None
-        Experiment run ID.
-    sample : int | None
-        Optional sample limit on Source 1.
-    """
+    run_id: str | None = None,
+) -> Dict[str, Any]:
+    """Execute Stage 1: Candidate blocking on real dataset."""
+    from business_entity_resolution.blocking import generate_candidate_pairs
     from business_entity_resolution.io_utils import (
         load_config,
         load_ground_truth,
         load_source,
         write_candidate_pairs,
     )
-    from business_entity_resolution.blocking import generate_candidate_pairs
 
-    # ── Load configs ────────────────────────────────────────────────
     cfg_dir = root / "code" / "business_entity_resolution" / "configs"
     paths_cfg = load_config(cfg_dir / "paths.yaml")
     blocking_cfg = load_config(cfg_dir / "blocking.yaml")
@@ -112,12 +114,20 @@ def run_blocking_stage(
 
     # ── Generate candidates ─────────────────────────────────────────
     t0 = time.time()
-    candidates = generate_candidate_pairs(s1, s2, s3, blocking_cfg)
+    out_dir = root / "output"
+    out_cand_file = out_dir / "candidate_pairs.tsv"
+    ckpt_dir = (root / "checkpoints") if (sample is None or sample <= 0) else None
+
+    candidates = generate_candidate_pairs(
+        s1, s2, s3, blocking_cfg,
+        checkpoint_dir=ckpt_dir,
+        output_path=out_cand_file,
+    )
     elapsed = time.time() - t0
 
-    # ── Write candidate_pairs.tsv ───────────────────────────────────
-    out_dir = root / "output"
-    write_candidate_pairs(candidates, out_dir / "candidate_pairs.tsv")
+    # Ensure final candidate file exists
+    if not out_cand_file.is_file() or out_cand_file.stat().st_size == 0:
+        write_candidate_pairs(candidates, out_cand_file)
 
     # ── Compute metrics ─────────────────────────────────────────────
     n_pairs = sum(len(v) for v in candidates.values())
@@ -159,66 +169,69 @@ def run_blocking_stage(
             for k in found_true_pairs_k.keys():
                 cand_set_k = set(cand_list[:k])
                 found_true_pairs_k[k] += len(true_matches & cand_set_k)
-                
-        for k in sorted(found_true_pairs_k.keys()):
-            r_k = found_true_pairs_k[k] / total_true_pairs if total_true_pairs > 0 else 0.0
-            k_lens = [min(len(cl), k) for cl in candidates.values()]
-            mean_k = sum(k_lens) / len(k_lens) if k_lens else 0.0
-            sorted_k_lens = sorted(k_lens)
-            median_k = sorted_k_lens[len(sorted_k_lens) // 2] if sorted_k_lens else 0.0
-            print(f"[blocking] Recall@{k}: {r_k:.4f} ({found_true_pairs_k[k]:,}/{total_true_pairs:,}) | Mean cands: {mean_k:.1f} | Median cands: {median_k:.1f}")
-            
-        recall = found_true_pairs_k[max_k] / total_true_pairs if total_true_pairs > 0 else 0.0
-    else:
-        print(f"[blocking] Ground truth not found at {gt_path} — skipping recall evaluation")
 
-    # ── Save metrics ────────────────────────────────────────────────
-    rid = run_id or time.strftime("%Y%m%d_%H%M%S")
-    exp_dir = root / "experiments" / rid
-    exp_dir.mkdir(parents=True, exist_ok=True)
+        print("\n" + "=" * 60)
+        print("BLOCKING EVALUATION REPORT")
+        print("=" * 60)
+        print(f"S1 Entities Evaluated:      {len(candidates):,}")
+        print(f"Total True Pairs Evaluated: {total_true_pairs:,}")
+        print(f"Total Candidate Pairs:      {n_pairs:,}")
+        print(f"Mean Candidates / S1:       {mean_cands:.2f}")
+        print(f"Median Candidates / S1:     {median_cands:.1f}")
+        print(f"Reduction Ratio:            {reduction_ratio * 100:.4f}%")
+        print(f"Elapsed Time:               {elapsed:.1f}s ({len(s1)/elapsed:.1f} queries/s)")
+        print("-" * 60)
+        for k in k_eval_list:
+            rec_k = found_true_pairs_k[k] / total_true_pairs if total_true_pairs > 0 else 0.0
+            print(f"  Recall@{k:<4}: {rec_k * 100:.2f}% ({found_true_pairs_k[k]:,}/{total_true_pairs:,} true pairs)")
+        print("=" * 60 + "\n")
+        recall = {f"recall@{k}": found_true_pairs_k[k] / total_true_pairs for k in k_eval_list} if total_true_pairs > 0 else {}
 
-    metrics = {
-        "stage": "blocking",
-        "run_id": rid,
-        "s1_entities": len(candidates),
-        "total_candidate_pairs": n_pairs,
-        "mean_candidates_per_s1": round(mean_cands, 2),
-        "median_candidates_per_s1": round(median_cands, 2),
-        "s1_with_candidates": n_with,
-        "reduction_ratio": round(reduction_ratio, 6),
-        "wall_clock_seconds": round(elapsed, 1),
+    return {
+        "n_s1": len(s1),
+        "n_pairs": n_pairs,
+        "mean_candidates": mean_cands,
+        "median_candidates": median_cands,
+        "reduction_ratio": reduction_ratio,
+        "elapsed_seconds": elapsed,
+        "recall": recall,
     }
-    if recall is not None:
-        metrics["recall"] = round(recall, 4)
-
-    metrics_path = exp_dir / "metrics.json"
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
-    print(f"[blocking] Metrics saved to {metrics_path}")
-    print(f"[blocking] Mean candidates/S1: {mean_cands:.1f}")
-    print(f"[blocking] Median candidates/S1: {median_cands:.1f}")
-    print(f"[blocking] Reduction ratio: {reduction_ratio:.6f}")
-    print(f"[blocking] Wall-clock: {elapsed:.0f}s")
-
-    return metrics
 
 
 def main(argv: list[str] | None = None) -> None:
     """Entry-point for the training pipeline."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    )
     args = parse_args(argv)
     print(f"[run_train] root = {args.root}")
+    print(f"[run_train] stage = {args.stage}")
+    if args.sample:
+        print(f"[run_train] sample = {args.sample}")
+    if args.run_id:
+        print(f"[run_train] run_id = {args.run_id}")
 
-    if args.stage == "blocking":
-        run_blocking_stage(args.root, run_id=args.run_id, sample=args.sample)
-    elif args.stage is None or args.stage == "all":
-        print("[run_train] Full training pipeline not yet implemented.")
-        print("[run_train] Use --stage blocking to run the blocking stage.")
-    else:
-        print(f"[run_train] Stage '{args.stage}' not yet implemented.")
+    # Add src to sys.path so package imports resolve cleanly
+    src_dir = args.root / "code" / "business_entity_resolution" / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+
+    if args.stage in ("blocking", "all"):
+        run_blocking_stage(args.root, sample=args.sample, run_id=args.run_id)
+        if args.stage == "blocking":
+            return
+
+    if args.stage in ("features", "all"):
+        print("[run_train] Stage 'features' not yet implemented (Milestone 6).")
+        if args.stage == "features":
+            return
+
+    if args.stage in ("train", "all"):
+        print("[run_train] Stage 'train' not yet implemented (Milestone 7).")
+        if args.stage == "train":
+            return
+
+    if args.stage in ("eval", "all"):
+        print("[run_train] Stage 'eval' not yet implemented (Milestone 8).")
+        if args.stage == "eval":
+            return
 
 
 if __name__ == "__main__":

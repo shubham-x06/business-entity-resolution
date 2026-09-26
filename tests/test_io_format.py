@@ -25,6 +25,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from business_entity_resolution.io_utils import (  # noqa: E402
+    append_candidate_pairs,
+    load_candidate_pairs,
     load_ground_truth,
     load_source,
     load_tsv,
@@ -41,7 +43,7 @@ GT_PATH = TRAIN_DIR / "train_ground_truth.tsv"
 
 
 # ===================================================================
-# 1.  load_source – schema & prefix validation
+# 1.  load_source
 # ===================================================================
 
 class TestLoadSource:
@@ -56,26 +58,27 @@ class TestLoadSource:
         assert list(df.columns) == [
             "entity_id", "business_name", "business_address", "country",
         ]
-        # All entity_ids start with S1-
         assert df["entity_id"].str.startswith("S1-").all()
+        assert (df["country"] == "US").sum() == 1_323_633
+        assert (df["country"] == "India").sum() == 883_188
 
     def test_validates_columns(self, tmp_path: Path) -> None:
         """Missing required columns should raise ValueError."""
         bad = tmp_path / "bad.tsv"
-        bad.write_text("entity_id\tname\n" "S1-001\tFoo\n", encoding="utf-8")
+        bad.write_text("entity_id\tbusiness_name\nS1-001\tAcme\n", encoding="utf-8")
         with pytest.raises(ValueError, match="missing required columns"):
-            load_source(bad)
+            load_source(bad, expected_source=1)
 
     def test_validates_prefix(self, tmp_path: Path) -> None:
-        """Wrong entity_id prefix should raise ValueError."""
-        f = tmp_path / "src.tsv"
-        f.write_text(
+        """Entity IDs not starting with expected prefix should raise ValueError."""
+        bad = tmp_path / "wrong_prefix.tsv"
+        bad.write_text(
             "entity_id\tbusiness_name\tbusiness_address\tcountry\n"
-            "S2-001\tFoo\t123 Main\tUS\n",
+            "S2-001\tAcme\t123 Main\tUS\n",
             encoding="utf-8",
         )
-        with pytest.raises(ValueError, match="do not start with"):
-            load_source(f, expected_source=1)
+        with pytest.raises(ValueError, match="lack the 'S1-' prefix"):
+            load_source(bad, expected_source=1)
 
     def test_prefix_validation_passes_correct_source(self, tmp_path: Path) -> None:
         """Correct prefix should pass without error."""
@@ -154,24 +157,26 @@ class TestLoadGroundTruth:
             load_ground_truth(f)
 
     def test_missing_file_warns(self, tmp_path: Path) -> None:
-        """Missing file should warn and return empty DataFrame."""
+        """Missing ground-truth file should warn and return empty DataFrame."""
+        missing = tmp_path / "nope_gt.tsv"
         with pytest.warns(UserWarning, match="not found"):
-            df = load_ground_truth(tmp_path / "gone.tsv")
+            df = load_ground_truth(missing)
         assert len(df) == 0
+        assert list(df.columns) == ["source1_entity_id", "matched_entity_ids"]
 
 
 # ===================================================================
-# 3.  Writer round-trip tests
+# 3.  write_matching_results & write_candidate_pairs
 # ===================================================================
 
 class TestWriteMatchingResults:
     """Tests for write_matching_results() byte-exact format."""
 
     def test_roundtrip_byte_exact(self, tmp_path: Path) -> None:
-        """write → read must reproduce the exact format from the README."""
+        """write → read must match the byte-exact specification."""
         matches = {
-            "S1-00001": ["S2-00047", "S2-00193", "S3-00812"],
-            "S1-00002": ["S3-00004"],
+            "S1-00001": ["S2-00047", "S3-00812"],
+            "S1-00002": ["S2-00193"],
             "S1-00003": [],  # singleton
         }
         out = tmp_path / "matching_results.tsv"
@@ -179,22 +184,20 @@ class TestWriteMatchingResults:
 
         expected = (
             "source1_entity_id\tmatched_entity_ids\n"
-            "S1-00001\tS2-00047,S2-00193,S3-00812\n"
-            "S1-00002\tS3-00004\n"
+            "S1-00001\tS2-00047,S3-00812\n"
+            "S1-00002\tS2-00193\n"
             "S1-00003\t\n"
         )
         actual = out.read_text(encoding="utf-8")
-        assert actual == expected, (
-            f"Byte mismatch.\nExpected:\n{expected!r}\nActual:\n{actual!r}"
-        )
+        assert actual == expected
 
     def test_roundtrip_load_back(self, tmp_path: Path) -> None:
-        """The written file must be loadable with load_tsv and retain values."""
+        """Written file must be loadable by load_tsv without error."""
         matches = {
             "S1-001": ["S2-010", "S3-020"],
             "S1-002": [],
         }
-        out = tmp_path / "mr.tsv"
+        out = tmp_path / "matching_results.tsv"
         write_matching_results(matches, out)
 
         df = load_tsv(out)
@@ -241,6 +244,28 @@ class TestWriteCandidatePairs:
         deep = tmp_path / "x" / "y" / "z" / "cp.tsv"
         write_candidate_pairs({"S1-001": ["S2-002"]}, deep)
         assert deep.is_file()
+
+    def test_append_candidate_pairs_incremental(self, tmp_path: Path) -> None:
+        """append_candidate_pairs should write header on first call and append subsequently."""
+        out = tmp_path / "incremental_cp.tsv"
+        part1 = {"S1-001": ["S2-010"], "S1-002": []}
+        part2 = {"S1-003": ["S3-030", "S2-020"], "S1-004": ["S3-040"]}
+
+        append_candidate_pairs(part1, out, write_header=True)
+        append_candidate_pairs(part2, out, write_header=False)
+
+        loaded = load_candidate_pairs(out)
+        assert len(loaded) == 4
+        assert loaded["S1-001"] == ["S2-010"]
+        assert loaded["S1-002"] == []
+        assert loaded["S1-003"] == ["S3-030", "S2-020"]
+        assert loaded["S1-004"] == ["S3-040"]
+
+    def test_load_candidate_pairs_missing_warns(self, tmp_path: Path) -> None:
+        """Missing candidate pairs file should warn and return empty dict."""
+        with pytest.warns(UserWarning, match="Candidate pairs file not found"):
+            res = load_candidate_pairs(tmp_path / "nonexistent.tsv")
+        assert res == {}
 
 
 # ===================================================================
