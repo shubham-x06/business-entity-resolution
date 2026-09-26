@@ -264,12 +264,12 @@ def write_matching_results(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    lines: List[str] = ["source1_entity_id\tmatched_entity_ids"]
-    for s1_id in sorted(matches):
-        matched = ",".join(matches[s1_id])
-        lines.append(f"{s1_id}\t{matched}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("source1_entity_id\tmatched_entity_ids\n")
+        for s1_id in sorted(matches):
+            matched = ",".join(matches[s1_id])
+            f.write(f"{s1_id}\t{matched}\n")
 
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     logger.info("Wrote %s (%d entries)", path, len(matches))
 
 
@@ -296,10 +296,10 @@ def write_candidate_pairs(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    lines: List[str] = ["source1_entity_id\tcandidate_entity_ids"]
-    for s1_id in sorted(candidates):
-        cands = ",".join(candidates[s1_id])
-        lines.append(f"{s1_id}\t{cands}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("source1_entity_id\tcandidate_entity_ids\n")
+        for s1_id in sorted(candidates):
+            cands = ",".join(candidates[s1_id])
+            f.write(f"{s1_id}\t{cands}\n")
 
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     logger.info("Wrote %s (%d entries)", path, len(candidates))
