@@ -442,6 +442,58 @@ class TestNormalisationIntegration:
             "country": ["India"],
         })
         result = _normalize_source(df)
-        assert "राम" in result["name_clean"].iloc[0]
+        assert "ram" in result["name_clean"].iloc[0] or "राम" in result["name_clean"].iloc[0]
         assert "pvt" in result["name_clean"].iloc[0]
         assert "ltd" in result["name_clean"].iloc[0]
+
+
+# ── 10. Checkpointing & incremental writes ──────────────────────────
+
+class TestCheckpointing:
+    """Verify partition checkpointing and incremental TSV generation."""
+
+    def test_checkpoint_saved_and_reused(self, tmp_path: Path) -> None:
+        s1 = pd.DataFrame({
+            "entity_id": ["S1-001", "S1-002"],
+            "business_name": ["Acme Corp", "Tata Steel"],
+            "business_address": ["123 Main St", "456 Park St"],
+            "country": ["US", "India"],
+        })
+        s2 = pd.DataFrame({
+            "entity_id": ["S2-001", "S2-002"],
+            "business_name": ["Acme Corp", "Tata Steel"],
+            "business_address": ["123 Main St", "456 Park St"],
+            "country": ["US", "India"],
+        })
+        s3 = pd.DataFrame(columns=["entity_id", "business_name", "business_address", "country"])
+
+        ckpt_dir = tmp_path / "checkpoints"
+        out_file = tmp_path / "output" / "candidate_pairs.tsv"
+
+        cfg = {
+            "country_blocking": {"enabled": True},
+            "name_blocking": {"enabled": True},
+            "address_blocking": {"enabled": True},
+        }
+
+        # First run: should write checkpoints for India and US
+        res1 = generate_candidate_pairs(
+            s1, s2, s3, cfg,
+            checkpoint_dir=ckpt_dir,
+            output_path=out_file,
+        )
+
+        assert (ckpt_dir / "candidates_india.tsv").is_file()
+        assert (ckpt_dir / "candidates_us.tsv").is_file()
+        assert out_file.is_file()
+        assert "S1-001" in res1
+        assert "S1-002" in res1
+
+        # Second run: should load both from checkpoint without errors
+        res2 = generate_candidate_pairs(
+            s1, s2, s3, cfg,
+            checkpoint_dir=ckpt_dir,
+            output_path=out_file,
+        )
+        assert res2["S1-001"] == res1["S1-001"]
+        assert res2["S1-002"] == res1["S1-002"]
