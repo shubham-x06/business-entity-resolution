@@ -102,6 +102,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Output destination path (.parquet or .tsv) for extracted features.",
     )
+    parser.add_argument(
+        "--candidate-pairs-path",
+        type=Path,
+        default=None,
+        help=(
+            "Override path to the candidate pairs TSV file. "
+            "Default: output/candidate_pairs.tsv (combined). "
+            "Use checkpoints/candidates_india.tsv or candidates_us.tsv "
+            "to run a single partition without the full 5.7GB combined file."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -228,6 +239,7 @@ def run_features_stage(
     max_pairs: int | None = None,
     chunk_size: int = 100000,
     output_path: Path | None = None,
+    candidate_pairs_path: Path | None = None,
     run_id: str | None = None,
 ) -> Dict[str, Any]:
     """Execute Stage 2: Vectorized chunked pairwise feature extraction."""
@@ -236,7 +248,9 @@ def run_features_stage(
         extract_features_streaming,
     )
 
-    cand_path = root / "output" / "candidate_pairs.tsv"
+    # Allow callers to point at a country-specific checkpoint (e.g. checkpoints/candidates_india.tsv)
+    # instead of the full combined output/candidate_pairs.tsv (5.7 GB).
+    cand_path = candidate_pairs_path or (root / "output" / "candidate_pairs.tsv")
     c_tag = country.lower() if country else "all"
     out = output_path or (root / "output" / f"features_{c_tag}.parquet")
 
@@ -247,6 +261,8 @@ def run_features_stage(
     )
 
     print(f"[features] Streaming candidate pairs: {cand_path} -> {out}")
+    if candidate_pairs_path:
+        print(f"[features] NOTE: using explicit --candidate-pairs-path override (not the combined file).")
     print(f"[features] Chunk size: {chunk_size:,} | Max pairs: {max_pairs or 'ALL'}")
 
     stats = extract_features_streaming(
@@ -310,6 +326,7 @@ def main(argv: list[str] | None = None) -> None:
             max_pairs=args.max_pairs,
             chunk_size=args.chunk_size,
             output_path=args.output,
+            candidate_pairs_path=args.candidate_pairs_path,
             run_id=args.run_id,
         )
         if args.stage == "features":
