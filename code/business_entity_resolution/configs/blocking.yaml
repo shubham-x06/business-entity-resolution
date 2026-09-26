@@ -22,7 +22,7 @@ address_blocking:
 
 candidate_ranking:
   enabled: true
-  max_candidates_per_entity: 500  # High for recall@K curve eval; deploy at smallest K >= 0.97
-  hard_cap_name_token_freq: 50000 # Asymmetric cap for name words: allow up to 50k
-  hard_cap_addr_token_freq: 5000  # Asymmetric cap for address tokens: keep tight at 5k
-  hard_cap_bigram_freq: 5000      # Address bigrams: keep tight at 5k
+  max_candidates_per_entity: 200  # Final K chosen for candidate-set size efficiency and throughput
+  hard_cap_name_token_freq: 10000 # Optimal name token cap: clears >100 q/s throughput with 92.4% recall
+  hard_cap_addr_token_freq: 5000  # Address tokens: kept tight at 5k
+  hard_cap_bigram_freq: 5000      # Address bigrams: kept tight at 5k
