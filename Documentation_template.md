@@ -39,9 +39,15 @@ To reduce the $O(N_1 \times (N_2 + N_3)) \approx 2.2\text{M} \times 10.3\text{M}
   - Address tokens capped at 5,000 to eliminate street number and generic locality posting-list bloat.
   - Name tokens capped at 10,000 (determined via empirical comparison against 15,000 and 20,000; cap=10k achieved 110.1 aggregate q/s with 92.38% Recall@200, whereas higher caps collapsed throughput by 30–40% without increasing top-200 recall due to candidate list dilution).
   - Selective posting list expansion skips traversing tokens $>5,000$ frequency whenever a query record possesses at least one distinctive token ($\le 5,000$ frequency).
-- **Candidate Set Size & Recall Ceiling (Known Tradeoff)**:
-  - Final candidate budget fixed at $K=200$ per Source 1 entity (mean: 199.5, reduction ratio $>0.99995$).
-  - Effective blocking recall ceiling is **92.38%** on ground truth. While unbounded candidate sizes ($K=500$) can capture ~93.9% recall, expanding candidate sets degrades the competition candidate-set penalty and increases downstream feature extraction latency 2.5×. Under the competition's precision-weighted $F_{0.5}$ metric ($\beta=0.5$), prioritizing clean, discriminative candidate sets at 110 q/s throughput provides the optimal foundation for high-precision classifier matching.
+- **Candidate Set Size & Recall Ceiling (Full Dataset Evaluation)**:
+  - Final candidate budget fixed at $K=200$ per Source 1 entity (mean: 199.42, median: 200.0, reduction ratio: **99.9981%** across all 2,206,821 S1 entities × 10,320,219 S2+S3 reference records).
+  - Evaluated on all **7,638,365 true ground-truth pairs**:
+    - **Recall@50**: 88.79% (6,781,778 true pairs)
+    - **Recall@100**: 90.95% (6,946,976 true pairs)
+    - **Recall@150**: 91.73% (7,006,359 true pairs)
+    - **Recall@200**: **92.20%** (7,042,261 true pairs)
+  - Full-scale pipeline throughput: **102.1 queries/sec aggregate** across the entire 2.206M query dataset, generating **440,091,505 candidate pairs** in `output/candidate_pairs.tsv` with zero data loss via per-partition checkpointing (`checkpoints/candidates_india.tsv` and `checkpoints/candidates_us.tsv`).
+  - Under the competition's precision-weighted $F_{0.5}$ metric ($\beta=0.5$), this 92.20% recall ceiling paired with a 99.9981% reduction ratio provides the optimal candidate pool for high-precision downstream feature extraction and classification.
 
 ---
 
