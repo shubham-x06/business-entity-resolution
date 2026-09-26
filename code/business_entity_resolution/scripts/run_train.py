@@ -138,7 +138,12 @@ def run_blocking_stage(
     if gt_path.is_file():
         gt = load_ground_truth(gt_path)
         total_true_pairs = 0
-        found_true_pairs_k = {k: 0 for k in [50, 100, 150, 200, 300, 500]}
+        max_k = blocking_cfg.get("candidate_ranking", {}).get("max_candidates_per_entity", 200)
+        k_eval_list = [k for k in [50, 100, 150, 200, 300, 500] if k <= max_k]
+        if max_k not in k_eval_list:
+            k_eval_list.append(max_k)
+        k_eval_list.sort()
+        found_true_pairs_k = {k: 0 for k in k_eval_list}
         
         for _, row in gt.iterrows():
             s1_id = row["source1_entity_id"]
@@ -163,7 +168,7 @@ def run_blocking_stage(
             median_k = sorted_k_lens[len(sorted_k_lens) // 2] if sorted_k_lens else 0.0
             print(f"[blocking] Recall@{k}: {r_k:.4f} ({found_true_pairs_k[k]:,}/{total_true_pairs:,}) | Mean cands: {mean_k:.1f} | Median cands: {median_k:.1f}")
             
-        recall = found_true_pairs_k[500] / total_true_pairs if total_true_pairs > 0 else 0.0
+        recall = found_true_pairs_k[max_k] / total_true_pairs if total_true_pairs > 0 else 0.0
     else:
         print(f"[blocking] Ground truth not found at {gt_path} — skipping recall evaluation")
 

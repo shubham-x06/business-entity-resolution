@@ -25,11 +25,23 @@
 ---
 
 ## 3. Candidate Generation (Blocking)
-*Describe how you reduced the comparison space to a manageable candidate set.*
 
-- **Blocking keys used:** [e.g., PIN code, phonetic name encoding, TF-IDF, etc.]
-- **Candidate pairs generated:** [total]
-- **How you ensured true matches were not lost:**
+To reduce the $O(N_1 \times (N_2 + N_3)) \approx 2.2\text{M} \times 10.3\text{M} \approx 2.27 \times 10^{13}$ pairwise comparison space, we employ a high-throughput multi-signal blocking pipeline:
+
+- **Country Partitioning**: Exact partitioning by country (`India`, `US`, and open-set `France` for test). Records from different countries are never cross-paired.
+- **Multi-Signal Inverted Indices**:
+  - Exact normalized name match (high weight = 10.0).
+  - Informative name word tokens (length $\ge 3$, excluding standard business stop words) with IDF weighting.
+  - Compound keys `(name_prefix_4, addr_token)` to pair entities with partial name overlap and shared location. For the US partition, 2-letter tokens are strictly filtered to an allowlist of valid US state abbreviations to avoid combinatorial explosion from generic 2-letter words.
+  - Address token and bigram overlap with IDF weighting.
+  - Name-only fallback path for the ~3.3% of Source 2/3 entities with missing or empty addresses.
+- **Asymmetric Frequency Capping & Selective Expansion**:
+  - Address tokens capped at 5,000 to eliminate street number and generic locality posting-list bloat.
+  - Name tokens capped at 10,000 (determined via empirical comparison against 15,000 and 20,000; cap=10k achieved 110.1 aggregate q/s with 92.38% Recall@200, whereas higher caps collapsed throughput by 30–40% without increasing top-200 recall due to candidate list dilution).
+  - Selective posting list expansion skips traversing tokens $>5,000$ frequency whenever a query record possesses at least one distinctive token ($\le 5,000$ frequency).
+- **Candidate Set Size & Recall Ceiling (Known Tradeoff)**:
+  - Final candidate budget fixed at $K=200$ per Source 1 entity (mean: 199.5, reduction ratio $>0.99995$).
+  - Effective blocking recall ceiling is **92.38%** on ground truth. While unbounded candidate sizes ($K=500$) can capture ~93.9% recall, expanding candidate sets degrades the competition candidate-set penalty and increases downstream feature extraction latency 2.5×. Under the competition's precision-weighted $F_{0.5}$ metric ($\beta=0.5$), prioritizing clean, discriminative candidate sets at 110 q/s throughput provides the optimal foundation for high-precision classifier matching.
 
 ---
 

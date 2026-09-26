@@ -44,6 +44,20 @@ NAME_STOP_WORDS: Set[str] = {
     "usa", "national", "state", "city",
 }
 
+# US state codes for compound-key filtering (2-letter tokens in addresses)
+_US_STATE_CODES: Set[str] = {
+    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga",
+    "hi", "id", "il", "in", "ia", "ks", "ky", "la", "me", "md",
+    "ma", "mi", "mn", "ms", "mo", "mt", "ne", "nv", "nh", "nj",
+    "nm", "ny", "nc", "nd", "oh", "ok", "or", "pa", "ri", "sc",
+    "sd", "tn", "tx", "ut", "vt", "va", "wa", "wv", "wi", "wy",
+    "dc",
+}
+
+# Threshold for "distinctive" token: if a query has any name-word with
+# posting list <= this size, we skip iterating larger lists entirely.
+_SELECTIVE_EXPANSION_THRESHOLD = 5000
+
 _LOG_EVERY = 500_000
 
 
@@ -356,6 +370,7 @@ def _build_partition_indices(
     hard_cap_name: int = 50000,
     hard_cap_addr: int = 5000,
     hard_cap_bigram: int = 5000,
+    country: Optional[str] = None,
 ) -> Tuple[
     Dict[str, List[str]],
     Dict[str, List[str]],
@@ -399,7 +414,17 @@ def _build_partition_indices(
 
             if name_enabled and n and len(n) >= prefix_len:
                 pfx = n[:prefix_len]
-                compound_toks = [t for t in a_words if len(t) >= 2]
+                # Restrict 2-letter tokens to US state codes when country=US
+                # to avoid combinatorial explosion from common short words
+                # ("no", "of", "in", etc.). For other countries, keep all
+                # tokens >= 3 chars (2-letter filtering is US-specific).
+                if country is not None and country.upper() == "US":
+                    compound_toks = [
+                        t for t in a_words
+                        if len(t) >= 3 or (len(t) == 2 and t in _US_STATE_CODES)
+                    ]
+                else:
+                    compound_toks = [t for t in a_words if len(t) >= 3]
                 for t in compound_toks:
                     compound_idx[(pfx, t)].append(eid)
 
@@ -456,6 +481,7 @@ def _query_partition_candidates(
     max_candidates: int = 100,
     ref_lookup_name: Optional[Dict[str, str]] = None,
     ref_lookup_addr: Optional[Dict[str, str]] = None,
+    country: Optional[str] = None,
 ) -> Dict[str, List[str]]:
     """Query candidates for each S1 entity in the partition.
 
@@ -509,22 +535,43 @@ def _query_partition_candidates(
                 scores[c] += 10.0
 
         # 2. Significant name words — IDF-weighted (base weight 3.0 * idf)
+        #    Selective expansion: only traverse large posting lists when no
+        #    cheaper distinctive token is available in the query.
         if name_enabled and n:
-            for w in set(n.split()):
-                if len(w) >= 3 and w not in NAME_STOP_WORDS and w in name_word_idx:
-                    w_idf = name_word_idf[w]
-                    for c in name_word_idx[w]:
-                        scores[c] += 3.0 * w_idf
+            q_name_words = [
+                w for w in set(n.split())
+                if len(w) >= 3 and w not in NAME_STOP_WORDS and w in name_word_idx
+            ]
+            # Check if query has at least one distinctive (small) posting list
+            has_distinctive = any(
+                len(name_word_idx[w]) <= _SELECTIVE_EXPANSION_THRESHOLD
+                for w in q_name_words
+            )
+            for w in q_name_words:
+                posting_size = len(name_word_idx[w])
+                # If we have a distinctive token, skip traversing huge lists
+                if has_distinctive and posting_size > _SELECTIVE_EXPANSION_THRESHOLD:
+                    continue
+                w_idf = name_word_idf[w]
+                for c in name_word_idx[w]:
+                    scores[c] += 3.0 * w_idf
 
         # 3. Address features — IDF-weighted
         if addr_enabled and a:
             a_words = a.split()
             toks = {t for t in a_words if len(t) >= 3 and (not t.isdigit() or len(t) >= 4)}
 
-            # Compound key: (name_prefix, addr_token) — allows 2-letter state & digits >= 2
+            # Compound key: (name_prefix, addr_token)
+            # Mirror the build-time filter for consistency
             if name_enabled and n and len(n) >= prefix_len:
                 pfx = n[:prefix_len]
-                compound_toks = {t for t in a_words if len(t) >= 2}
+                if country is not None and country.upper() == "US":
+                    compound_toks = {
+                        t for t in a_words
+                        if len(t) >= 3 or (len(t) == 2 and t in _US_STATE_CODES)
+                    }
+                else:
+                    compound_toks = {t for t in a_words if len(t) >= 3}
                 for t in compound_toks:
                     key = (pfx, t)
                     if key in compound_idx:
@@ -725,6 +772,7 @@ def generate_candidate_pairs(
             hard_cap_name=hard_cap_name,
             hard_cap_addr=hard_cap_addr,
             hard_cap_bigram=hard_cap_bigram,
+            country=country,
         )
         logger.info("  [%s] Inverted indices built in %.1fs (name_exact=%d, name_word=%d, compound=%d, addr_token=%d)",
                     c_label, time.time() - t_idx,
@@ -750,6 +798,7 @@ def generate_candidate_pairs(
             max_candidates=max_cands,
             ref_lookup_name=ref_lookup_name,
             ref_lookup_addr=ref_lookup_addr,
+            country=country,
         )
         logger.info("  [%s] Queried %d entities in %.1fs (%.0f/s)",
                     c_label, len(s1_eids), time.time() - t_query,
