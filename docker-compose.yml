@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: business-entity-resolution:latest
+    container_name: business-entity-resolution-pipeline
+    volumes:
+      - ./dataset:/app/dataset
+      - ./output:/app/output
+      - ./experiments:/app/experiments
+      - ./checkpoints:/app/checkpoints
+    working_dir: /app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/code/business_entity_resolution/src

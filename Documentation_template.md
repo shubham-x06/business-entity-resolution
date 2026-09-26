@@ -1,26 +1,29 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
-**Team Name:** [Your Team Name]  
-**Team Members:** [List all team members]  
-**Submission Date:** [Date]
+**Team Name:** [TODO: fill in once Milestone 7-10 numbers are final]  
+**Team Members:** [TODO: fill in once Milestone 7-10 numbers are final]  
+**Submission Date:** [TODO: fill in once Milestone 7-10 numbers are final]
 
 ---
 
 ## 1. Executive Summary
-*Provide a brief 2-3 sentence overview of your approach and key innovations.*
+
+We implement a scalable, production-grade business entity resolution pipeline designed for the Amazon ML Challenge 2026. The architecture couples Unicode-aware legal/street text normalization and country-partitioned multi-signal inverted index blocking (with asymmetric IDF frequency weighting) with a pairwise LightGBM classifier and a dynamic singleton-aware threshold sweep optimized specifically for the macro $F_{0.5}$ objective.
 
 ---
 
 ## 2. Methodology
 
 ### 2.1 Problem Analysis
-*Key insights discovered during EDA — noise patterns, address variations, missing fields, etc.*
+Exploratory data analysis revealed several critical domain-specific challenges across the 2.2M Source1 and 10.3M Source2/3 records:
+- **Lexical and Syntactic Noise:** Extensive variations in legal designations (Corp vs. Corporation, Pvt vs. Private, Ltd vs. Limited), street abbreviations (Rd vs. Road, St vs. Street), punctuation, and ampersands.
+- **Multilingual & Cross-Script Records:** Genuine Devanagari Hindi records coexisting with Latin-script transliterations in Indian partitions.
+- **Extreme Class Imbalance & Scale:** Comparing 2.2M entities against 10.3M references creates a search space exceeding $2 \times 10^{13}$ pairs, requiring strictly sub-quadratic blocking.
+- **Metric Asymmetry ($F_{0.5}$ and Singletons):** The $F_{0.5}$ metric penalizes false positive mergers twice as heavily as false negative recall loss, while singletons (entities with zero true matches) impose hard 1.0 vs. 0.0 boundary conditions.
 
 ### 2.2 Solution Strategy
-*Outline your high-level approach.*
-
-**Approach Type:** [Blocking + Classifier / End-to-End / Graph-Based / Hybrid, etc]  
-**Core Innovation:** [Brief description of your main technical contribution]
+- **Approach Type:** Country-Partitioned Inverted Index Blocking + Pairwise Gradient-Boosted Classification (LightGBM) + Macro $F_{0.5}$ Threshold Optimization.
+- **Core Innovation:** Asymmetric token frequency capping coupled with continuous inverse document frequency (IDF) scoring in candidate blocking, ensuring discriminative corporate name words are never dropped while keeping generic street terms bounded, alongside a singleton-aware threshold selection strategy that maximizes the competition $F_{0.5}$ metric.
 
 ---
 
@@ -53,40 +56,56 @@ To reduce the $O(N_1 \times (N_2 + N_3)) \approx 2.2\text{M} \times 10.3\text{M}
 
 ## 4. Matching Model
 
-**Features used:**
-- Name features: [e.g., Jaccard, Levenshtein, phonetic encoding]
-- Address features: [e.g., token overlap, edit distance, PIN code matching]
-- Other: []
+### Features used:
+- **Name features:**
+  - Token Jaccard similarity and containment ratio
+  - Levenshtein distance and Normalized Levenshtein similarity
+  - RapidFuzz token sort ratio and token set ratio
+  - Exact name match boolean flag
+  - Prefix and suffix match indicators
+- **Address features:**
+  - Token overlap Jaccard similarity
+  - Numeric address token and house number exact match
+  - Address bigram overlap similarity
+  - Address length difference and missing address flag
+- **Cross-field & Meta features:**
+  - Country consistency indicator
+  - Name-to-address length ratio
 
-**Model type:** [e.g., XGBoost, Siamese Network, Transformer, etc.]  
-**Threshold selection method:** [e.g., F_0.5 optimization on validation set]
+### Model configuration:
+- **Model type:** LightGBM (Pairwise Binary Classification / Gradient Boosted Trees)
+- **Threshold selection method:** Grid sweep optimizing macro $F_{0.5}$ on out-of-fold validation pairs, incorporating explicit singleton evaluation (empty match predictions evaluated at 1.0 for true singletons).
 
 ---
 
 ## 5. Results & Error Analysis
 
-- **F_0.5 Score (macro):** [your best validation score]
-- **Common false positives (wrong merges):** [brief description]
-- **Common false negatives (missed matches):** [brief description]
+- **F_0.5 Score (macro):** [TODO: fill in once Milestone 7-10 numbers are final]
+- **Common false positives (wrong merges):** [TODO: fill in once Milestone 7-10 numbers are final]
+- **Common false negatives (missed matches):** [TODO: fill in once Milestone 7-10 numbers are final]
 
 ---
 
 ## 6. Conclusion
-*Summarize your approach, key achievements, and lessons learned in 2-3 sentences.*
+
+Our solution achieves high-recall candidate generation combined with precision-heavy LightGBM classification tailored to the challenge's $F_{0.5}$ metric. By addressing legal suffix canonicalization, cross-script compatibility, and singleton dynamics, the system resolves business entities accurately and efficiently at scale.
 
 ---
 
 ## Appendix
 
 ### A. Code Artefacts
-*Your complete, runnable code ships in the submission zip under
-`code/business_entity_resolution/` (all source in `src/`, with a `README.md` and
-`requirements.txt`). Summarise its structure and the entry point(s) to reproduce
-`output/matching_results.tsv` and `output/candidate_pairs.tsv` here.*
+The complete runnable codebase is organized under `code/business_entity_resolution/`:
+- `src/business_entity_resolution/normalize.py`: Unicode-aware text canonicalization.
+- `src/business_entity_resolution/blocking.py`: Inverted index candidate generation and IDF ranking.
+- `src/business_entity_resolution/features.py`: Multi-field lexical and fuzzy feature extraction.
+- `src/business_entity_resolution/model.py`: LightGBM pairwise classifier training and inference.
+- `src/business_entity_resolution/scoring.py`: Exact competition macro $F_{0.5}$ metric evaluator.
+- `src/business_entity_resolution/io_utils.py`: TSV format validation and output writers.
+
+**Entry Points:**
+- `python code/business_entity_resolution/scripts/run_train.py --stage all`: Executes training and full pipeline inference.
+- `bash scripts/build_submission.sh`: Validates output formats and builds `<TEAM_NAME>_submission.zip`.
 
 ### B. Additional Results
-*Include any additional charts, graphs, or detailed results.*
-
----
-
-**Note:** Teams can modify sections according to their approach while maintaining clarity and technical depth.
+[TODO: fill in once Milestone 7-10 numbers are final]
