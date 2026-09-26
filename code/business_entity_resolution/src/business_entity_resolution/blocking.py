@@ -23,11 +23,17 @@ import math
 import logging
 import time
 from collections import Counter, defaultdict
-from typing import Any, Dict, List, Optional, Set, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import pandas as pd
 from datasketch import MinHash, MinHashLSH
 
+from business_entity_resolution.io_utils import (
+    append_candidate_pairs,
+    load_candidate_pairs,
+    write_candidate_pairs,
+)
 from business_entity_resolution.normalize import normalize_address, normalize_name
 
 logger = logging.getLogger(__name__)
@@ -520,7 +526,7 @@ def _query_partition_candidates(
     results: Dict[str, List[str]] = {}
     n_queries = len(s1_eids)
     t_query_start = time.time()
-    log_interval = max(n_queries // 10, 5000)
+    log_interval = min(max(n_queries // 10, 5000), 20000)
 
     for i in range(n_queries):
         eid = s1_eids[i]
@@ -647,6 +653,9 @@ def generate_candidate_pairs(
     source2: pd.DataFrame,
     source3: pd.DataFrame,
     blocking_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    checkpoint_dir: Optional[Union[Path, str]] = None,
+    output_path: Optional[Union[Path, str]] = None,
 ) -> Dict[str, List[str]]:
     """Generate all candidate pairs (source1_id → [candidate_ids]) via blocking.
 
@@ -658,6 +667,8 @@ def generate_candidate_pairs(
     3. Empty-address handling: records with empty addresses are blocked via name.
     4. Candidate ranking and capping: keeps high recall with controlled candidate set.
     5. Memory efficient: partition-by-partition processing, low RAM footprint.
+    6. Incremental checkpointing: saves each partition immediately upon completion
+       to avoid work loss, and appends to output_path incrementally.
 
     Parameters
     ----------
@@ -666,6 +677,12 @@ def generate_candidate_pairs(
     source3 : pd.DataFrame
     blocking_cfg : dict, optional
         Configuration dictionary (from blocking.yaml).
+    checkpoint_dir : Path or str, optional
+        Directory to read/write per-partition checkpoint TSVs
+        (e.g., ``checkpoints/candidates_india.tsv``).
+    output_path : Path or str, optional
+        Target TSV path (e.g. ``output/candidate_pairs.tsv``) to write
+        incrementally as each partition finishes.
 
     Returns
     -------
@@ -675,6 +692,18 @@ def generate_candidate_pairs(
     t0 = time.time()
     if blocking_cfg is None:
         blocking_cfg = {}
+
+    # ── Checkpointing setup ─────────────────────────────────────────
+    ckpt_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
+    if ckpt_dir is not None:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    out_file = Path(output_path) if output_path is not None else None
+    needs_header = True
+    if out_file is not None:
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        if out_file.is_file() and out_file.stat().st_size > 0:
+            needs_header = False
 
     # ── Config parameters ───────────────────────────────────────────
     country_cfg = blocking_cfg.get("country_blocking", {})
@@ -716,6 +745,26 @@ def generate_candidate_pairs(
     for country in countries:
         t_part = time.time()
         c_label = country if country is not None else "ALL"
+
+        # Check for existing partition checkpoint
+        ckpt_file = ckpt_dir / f"candidates_{c_label.lower()}.tsv" if ckpt_dir is not None else None
+        if ckpt_file is not None and not ckpt_file.is_file():
+            alt_ckpt = ckpt_dir / f"checkpoint_candidates_{c_label.lower()}.tsv"
+            if alt_ckpt.is_file():
+                ckpt_file = alt_ckpt
+
+        if ckpt_file is not None and ckpt_file.is_file():
+            logger.info("  [%s] Found checkpoint: %s — loading from disk instead of querying", c_label, ckpt_file)
+            part_cands = load_candidate_pairs(ckpt_file)
+            logger.info("  [%s] Loaded %d entities from checkpoint", c_label, len(part_cands))
+            for eid, cands in part_cands.items():
+                all_candidates[eid] = cands
+
+            if out_file is not None and (not out_file.is_file() or out_file.stat().st_size == 0):
+                append_candidate_pairs(part_cands, out_file, write_header=needs_header)
+                needs_header = False
+
+            continue
 
         # ── Slice partition ─────────────────────────────────────────
         if country is not None:
@@ -800,11 +849,28 @@ def generate_candidate_pairs(
             ref_lookup_addr=ref_lookup_addr,
             country=country,
         )
-        logger.info("  [%s] Queried %d entities in %.1fs (%.0f/s)",
-                    c_label, len(s1_eids), time.time() - t_query,
-                    len(s1_eids) / max(time.time() - t_query, 0.001))
+        t_query_done = time.time()
+        part_duration = t_query_done - t_part
+        logger.info("  [%s] Queried %d entities in %.1fs (%.0f/s) — total partition time: %.1fs (%.2fh)",
+                    c_label, len(s1_eids), t_query_done - t_query,
+                    len(s1_eids) / max(t_query_done - t_query, 0.001),
+                    part_duration, part_duration / 3600.0)
 
-        # Merge partition results
+        # ── 1. Checkpoint partition immediately to disk ─────────────
+        if ckpt_dir is not None:
+            save_ckpt = ckpt_dir / f"candidates_{c_label.lower()}.tsv"
+            write_candidate_pairs(part_cands, save_ckpt)
+            logger.info("  [%s] Checkpoint saved: %s (%d entities)",
+                        c_label, save_ckpt, len(part_cands))
+
+        # ── 2. Incrementally write/append to output candidate TSV ────
+        if out_file is not None:
+            append_candidate_pairs(part_cands, out_file, write_header=needs_header)
+            needs_header = False
+            logger.info("  [%s] Incrementally appended %d entities to %s",
+                        c_label, len(part_cands), out_file)
+
+        # ── 3. Merge partition results in memory ─────────────────────
         for eid, cands in part_cands.items():
             all_candidates[eid] = cands
 
