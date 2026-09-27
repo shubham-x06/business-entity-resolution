@@ -5,6 +5,7 @@ dataset/
 checkpoints/
 experiments/*
 !experiments/eda_report.md
+!experiments/validation_entities.txt
 output/
 
 # Python
