@@ -56,7 +56,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=["all", "blocking", "features", "train", "model", "eval"],
+        choices=["all", "blocking", "features", "train", "model", "eval", "threshold-tuning"],
         default="all",
         help="Which pipeline stage to execute. Default: 'all'.",
     )
@@ -312,42 +312,6 @@ def run_features_stage(
     return stats
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Entry-point for the training pipeline."""
-    args = parse_args(argv)
-    print(f"[run_train] root = {args.root}")
-    print(f"[run_train] stage = {args.stage}")
-    if args.country:
-        print(f"[run_train] country = {args.country}")
-    if args.sample:
-        print(f"[run_train] sample = {args.sample}")
-    if args.max_pairs:
-        print(f"[run_train] max_pairs = {args.max_pairs}")
-    if args.run_id:
-        print(f"[run_train] run_id = {args.run_id}")
-
-    # Add src to sys.path so package imports resolve cleanly
-    src_dir = args.root / "code" / "business_entity_resolution" / "src"
-    if str(src_dir) not in sys.path:
-        sys.path.insert(0, str(src_dir))
-
-    if args.stage in ("blocking", "all"):
-        run_blocking_stage(args.root, sample=args.sample, run_id=args.run_id)
-        if args.stage == "blocking":
-            return
-
-    if args.stage in ("features", "all"):
-        run_features_stage(
-            root=args.root,
-            country=args.country,
-            max_pairs=args.max_pairs,
-            chunk_size=args.chunk_size,
-            output_path=args.output,
-            candidate_pairs_path=args.candidate_pairs_path,
-            run_id=args.run_id,
-        )
-        if args.stage == "features":
-            return
 
 def run_model_stage(
     root: Path,
@@ -612,6 +576,303 @@ def run_model_stage(
     return report
 
 
+def run_threshold_tuning_stage(
+    root: Path,
+    sample: int | None = None,
+    run_id: str | None = None,
+    thresholds: list[float] | None = None,
+) -> Dict[str, Any]:
+    """Execute Stage 4: F_0.5-optimal threshold tuning & many-to-many grouping."""
+    import gc
+    import json
+    from collections import defaultdict
+    import numpy as np
+    import pyarrow.parquet as pq
+    from business_entity_resolution.grouping import (
+        DEFAULT_THRESHOLDS,
+        group_by_threshold,
+        sweep_thresholds,
+        sweep_thresholds_per_country,
+    )
+    from business_entity_resolution.io_utils import load_config, load_source
+    from business_entity_resolution.model import (
+        DEFAULT_FEATURE_COLUMNS,
+        get_peak_memory_mb,
+        load_model,
+    )
+    from business_entity_resolution.scoring import load_matches_dict
+
+    t_stage_start = time.time()
+    cfg_dir = root / "code" / "business_entity_resolution" / "configs"
+    paths_cfg = load_config(cfg_dir / "paths.yaml")
+
+    ckpt_dir = root / "checkpoints"
+    # Locate model artifact (prefer cap40 model, then lgbm_model.txt, then models/)
+    model_path = ckpt_dir / "lgbm_model_cap40.txt"
+    if not model_path.is_file():
+        model_path = ckpt_dir / "lgbm_model.txt"
+    if not model_path.is_file():
+        model_path = root / "models" / "lgbm_entity_model.txt"
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Model artifact not found in {ckpt_dir} or {root / 'models'}!")
+
+    val_cand_path = ckpt_dir / "val_candidates.parquet"
+    if not val_cand_path.is_file():
+        val_cand_path = ckpt_dir / "val_candidates_cap40.parquet"
+    if not val_cand_path.is_file():
+        raise FileNotFoundError(f"Validation candidates parquet not found in {ckpt_dir}!")
+
+    val_entity_file = ckpt_dir / "val_entity_ids.json"
+    if not val_entity_file.is_file():
+        raise FileNotFoundError(f"Validation entity file not found: {val_entity_file}!")
+
+    gt_path = root / paths_cfg["data"]["train"]["ground_truth"]
+    s1_path = root / paths_cfg["data"]["train"]["source1"]
+
+    print("\n" + "=" * 60)
+    print("STAGE 4: F_0.5-OPTIMAL THRESHOLD TUNING & GROUPING")
+    print("=" * 60)
+    print(f"Model Artifact:        {model_path} ({model_path.stat().st_size / (1024**2):.2f} MB)")
+    print(f"Val Candidates:        {val_cand_path} ({val_cand_path.stat().st_size / (1024**2):.2f} MB)")
+    print(f"Peak RAM at startup:   {get_peak_memory_mb():.1f} MB")
+    print("-" * 60)
+
+    # 1. Load model
+    print(f"[threshold-tuning] Loading LightGBM model from {model_path.name}...")
+    clf = load_model(model_path)
+
+    # 2. Load ground truth and entity metadata
+    gt_dict = load_matches_dict(gt_path)
+    s1 = load_source(s1_path, expected_source=1)
+    s1_country_map = dict(zip(s1["entity_id"], s1["country"]))
+
+    val_entities = json.loads(val_entity_file.read_text(encoding="utf-8"))
+    if sample is not None and sample > 0:
+        val_entities = val_entities[:sample]
+        print(f"[threshold-tuning] Sampled to first {len(val_entities):,} validation entities")
+
+    val_gt = {eid: gt_dict.get(eid, set()) for eid in val_entities}
+    entity_countries = {eid: s1_country_map.get(eid, "_unknown") for eid in val_entities}
+    val_set = set(val_entities)
+
+    n_sing = sum(1 for true_ids in val_gt.values() if len(true_ids) == 0)
+    n_match = len(val_gt) - n_sing
+    print(
+        f"[threshold-tuning] Universe: {len(val_entities):,} validation entities "
+        f"({n_sing:,} singletons, {n_match:,} matched)"
+    )
+
+    # Threshold grid to evaluate
+    sweep_grid = thresholds or [0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.98, 0.99]
+    min_thresh = min(sweep_grid)
+
+    # 3. Stream validation candidates, predicting and pre-filtering to score >= min_thresh
+    print(
+        f"\n[threshold-tuning] Streaming 44M candidate pairs with memory-safe pre-filtering (min_thresh={min_thresh})..."
+    )
+    t_pred_start = time.time()
+    pf = pq.ParquetFile(val_cand_path)
+    cols_to_read = ["source1_entity_id", "candidate_entity_id"] + DEFAULT_FEATURE_COLUMNS
+
+    scored_pairs: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+    # Ensure every validation entity has an entry in scored_pairs (even if empty)
+    for eid in val_entities:
+        scored_pairs[eid] = []
+
+    pairs_scanned = 0
+    pairs_retained = 0
+    batch_size = 500000
+
+    for batch in pf.iter_batches(batch_size=batch_size, columns=cols_to_read):
+        s1_ids = batch["source1_entity_id"].to_pylist()
+        cand_ids = batch["candidate_entity_id"].to_pylist()
+
+        X_batch = np.column_stack([
+            batch[col].to_numpy(zero_copy_only=False) for col in DEFAULT_FEATURE_COLUMNS
+        ]).astype(np.float32)
+
+        if hasattr(clf, "predict_proba"):
+            probs = clf.predict_proba(X_batch)[:, 1]
+        elif hasattr(clf, "predict"):
+            probs = clf.predict(X_batch)
+        else:
+            raise TypeError(f"Unknown classifier type: {type(clf)}")
+
+        keep_idx = np.where(probs >= min_thresh)[0]
+        for idx in keep_idx:
+            eid = s1_ids[idx]
+            if eid in val_set:
+                scored_pairs[eid].append((cand_ids[idx], float(probs[idx])))
+                pairs_retained += 1
+
+        pairs_scanned += len(s1_ids)
+
+    pred_elapsed = time.time() - t_pred_start
+    peak_ram_pred = get_peak_memory_mb()
+    print(
+        f"[threshold-tuning] Scored {pairs_scanned:,} pairs in {pred_elapsed:.2f}s "
+        f"({pairs_scanned / pred_elapsed:,.0f} pairs/s) | "
+        f"Retained pairs (P >= {min_thresh}): {pairs_retained:,} | "
+        f"Peak RAM: {peak_ram_pred:.1f} MB"
+    )
+
+    # 4. Global threshold sweep using grouping.sweep_thresholds
+    print(f"\n[threshold-tuning] Running global threshold sweep over {sweep_grid}...")
+    t_sweep_start = time.time()
+    sweep_res = sweep_thresholds(
+        scored_pairs=scored_pairs,
+        ground_truth=val_gt,
+        thresholds=sweep_grid,
+        beta=0.5,
+    )
+    sweep_elapsed = time.time() - t_sweep_start
+
+    best_thresh = sweep_res["best_threshold"]
+    best_metrics = sweep_res["best_metrics"]
+
+    # 5. Per-country threshold sweep using grouping.sweep_thresholds_per_country
+    print(f"[threshold-tuning] Running per-country threshold sweep...")
+    country_res = sweep_thresholds_per_country(
+        scored_pairs=scored_pairs,
+        ground_truth=val_gt,
+        entity_countries=entity_countries,
+        thresholds=sweep_grid,
+        beta=0.5,
+    )
+
+    # 6. Evaluate predictions at chosen threshold and calculate many-to-many sanity stats
+    best_preds = group_by_threshold(scored_pairs, threshold=best_thresh)
+
+    # Many-to-many sanity check
+    s1_multi_s2 = 0
+    s1_multi_s3 = 0
+    s1_multi_either = 0
+    s1_multi_both = 0
+    total_predicted_matches = 0
+    entities_with_any_pred = 0
+
+    for eid, cands in best_preds.items():
+        if not cands:
+            continue
+        entities_with_any_pred += 1
+        total_predicted_matches += len(cands)
+        n_s2 = sum(1 for cid in cands if cid.startswith("S2-"))
+        n_s3 = sum(1 for cid in cands if cid.startswith("S3-"))
+        if n_s2 > 1:
+            s1_multi_s2 += 1
+        if n_s3 > 1:
+            s1_multi_s3 += 1
+        if n_s2 > 1 or n_s3 > 1:
+            s1_multi_either += 1
+        if n_s2 > 1 and n_s3 > 1:
+            s1_multi_both += 1
+
+    stage_elapsed = time.time() - t_stage_start
+    peak_ram_final = get_peak_memory_mb()
+
+    # 7. Experiment logging
+    exp_run_id = run_id or f"threshold_tuning_{int(time.time())}"
+    exp_dir = root / "experiments" / exp_run_id
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    metrics_file = exp_dir / "metrics.json"
+
+    # Separate cohort metrics at best threshold
+    india_metrics = country_res.get("India", {}).get("sweep", {}).get(best_thresh, {})
+    us_metrics = country_res.get("US", {}).get("sweep", {}).get(best_thresh, {})
+
+    report = {
+        "run_id": exp_run_id,
+        "stage": "threshold_tuning",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "model_artifact": str(model_path.name),
+        "chosen_threshold": best_thresh,
+        "overall_macro_f_beta": best_metrics["macro_f_beta"],
+        "singleton_mean": best_metrics["singleton_mean"],
+        "has_match_mean": best_metrics["has_match_mean"],
+        "n_entities": best_metrics["n_entities"],
+        "n_singletons": best_metrics["n_singletons"],
+        "n_has_match": best_metrics["n_has_match"],
+        "india_metrics_at_chosen_threshold": india_metrics,
+        "us_metrics_at_chosen_threshold": us_metrics,
+        "country_sweep_independent_optima": {
+            c: {
+                "best_threshold": r["best_threshold"],
+                "macro_f_beta": r["best_metrics"]["macro_f_beta"],
+            }
+            for c, r in country_res.items()
+        },
+        "many_to_many_stats": {
+            "entities_with_any_prediction": entities_with_any_pred,
+            "total_predicted_matches": total_predicted_matches,
+            "avg_matches_per_matched_entity": (total_predicted_matches / entities_with_any_pred) if entities_with_any_pred > 0 else 0.0,
+            "entities_with_gt1_s2_match": s1_multi_s2,
+            "entities_with_gt1_s3_match": s1_multi_s3,
+            "entities_with_gt1_match_either_source": s1_multi_either,
+            "entities_with_gt1_match_both_sources": s1_multi_both,
+        },
+        "full_sweep_table": {
+            f"{th:.2f}": m for th, m in sweep_res["sweep"].items()
+        },
+        "timing": {
+            "prediction_elapsed_seconds": pred_elapsed,
+            "sweep_elapsed_seconds": sweep_elapsed,
+            "total_stage_seconds": stage_elapsed,
+            "peak_memory_mb": peak_ram_final,
+        },
+    }
+    metrics_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"\n[threshold-tuning] Metrics successfully logged to {metrics_file}")
+
+    # 8. Print comprehensive evaluation tables
+    print("\n" + "=" * 90)
+    print(f"THRESHOLD TUNING SWEEP RESULTS (MODEL: {model_path.name})")
+    print("=" * 90)
+    print(f"{'Thresh':<8} {'Overall F0.5':<14} {'Singleton':<12} {'Has-Match':<12} {'India F0.5':<12} {'US F0.5':<10} {'Status'}")
+    print("-" * 90)
+    for th in sweep_grid:
+        ov = sweep_res["sweep"].get(th, {})
+        ind = country_res.get("India", {}).get("sweep", {}).get(th, {})
+        us = country_res.get("US", {}).get("sweep", {}).get(th, {})
+        is_best = "* CHOSEN" if th == best_thresh else ""
+        print(
+            f"{th:<8.2f} {ov.get('macro_f_beta', 0.0):<14.4f} {ov.get('singleton_mean', 0.0):<12.4f} "
+            f"{ov.get('has_match_mean', 0.0):<12.4f} {ind.get('macro_f_beta', 0.0):<12.4f} {us.get('macro_f_beta', 0.0):<10.4f} {is_best}"
+        )
+    print("=" * 90)
+
+    print("\n" + "=" * 60)
+    print("CHOSEN THRESHOLD PERFORMANCE SUMMARY")
+    print("=" * 60)
+    print(f"Operating Threshold:      {best_thresh:.2f}")
+    print(f"Overall Macro F_0.5:      {best_metrics['macro_f_beta']:.4f}")
+    print(f"  Singleton Subset F_0.5: {best_metrics['singleton_mean']:.4f} ({best_metrics['n_singletons']:,} entities)")
+    print(f"  Has-Match Subset F_0.5: {best_metrics['has_match_mean']:.4f} ({best_metrics['n_has_match']:,} entities)")
+    print("-" * 60)
+    print(f"India Macro F_0.5:        {india_metrics.get('macro_f_beta', 0.0):.4f} ({india_metrics.get('n_entities', 0):,} entities)")
+    print(f"  India Singleton Mean:   {india_metrics.get('singleton_mean', 0.0):.4f}")
+    print(f"  India Has-Match Mean:   {india_metrics.get('has_match_mean', 0.0):.4f}")
+    print(f"US Macro F_0.5:           {us_metrics.get('macro_f_beta', 0.0):.4f} ({us_metrics.get('n_entities', 0):,} entities)")
+    print(f"  US Singleton Mean:      {us_metrics.get('singleton_mean', 0.0):.4f}")
+    print(f"  US Has-Match Mean:      {us_metrics.get('has_match_mean', 0.0):.4f}")
+    print("-" * 60)
+    print("MANY-TO-MANY SANITY CHECK COUNTS:")
+    print(f"  Entities with >1 S2 match:          {s1_multi_s2:,}")
+    print(f"  Entities with >1 S3 match:          {s1_multi_s3:,}")
+    print(f"  Entities with >1 match (either):    {s1_multi_either:,}")
+    print(f"  Entities with >1 match (both S2&S3):{s1_multi_both:,}")
+    print(f"  Total Predicted Match Pairs:        {total_predicted_matches:,}")
+    if entities_with_any_pred > 0:
+        print(f"  Avg Matches per Matched Entity:     {(total_predicted_matches / entities_with_any_pred):.2f}")
+    print("-" * 60)
+    print(f"Prediction & Filter Time: {pred_elapsed:.2f} s")
+    print(f"Threshold Sweep Time:     {sweep_elapsed:.2f} s")
+    print(f"Total Stage Time:         {stage_elapsed:.2f} s ({stage_elapsed / 60.0:.2f} min)")
+    print(f"Peak Working Set RAM:     {peak_ram_final:.1f} MB")
+    print("=" * 60 + "\n")
+
+    return report
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry-point for the training pipeline."""
     args = parse_args(argv)
@@ -662,11 +923,16 @@ def main(argv: list[str] | None = None) -> None:
         if args.stage in ("train", "model"):
             return
 
-    if args.stage in ("eval", "all"):
-        print("[run_train] Stage 'eval' not yet implemented (Milestone 8).")
-        if args.stage == "eval":
+    if args.stage in ("threshold-tuning", "eval", "all"):
+        run_threshold_tuning_stage(
+            root=args.root,
+            sample=args.sample,
+            run_id=args.run_id,
+        )
+        if args.stage in ("threshold-tuning", "eval"):
             return
 
 
 if __name__ == "__main__":
     main()
+
