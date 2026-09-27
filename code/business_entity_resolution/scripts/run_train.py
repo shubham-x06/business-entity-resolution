@@ -56,9 +56,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=["all", "blocking", "features", "train", "eval"],
+        choices=["all", "blocking", "features", "train", "model", "eval"],
         default="all",
         help="Which pipeline stage to execute. Default: 'all'.",
+    )
+    parser.add_argument(
+        "--val-ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of S1 entities to hold out for stratified validation. Default: 0.10.",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Classification probability threshold for validation evaluation. Default: 0.5.",
+    )
+    parser.add_argument(
+        "--force-mine",
+        action="store_true",
+        help="Force re-execution of streaming hard-negative mining even if checkpoint exists.",
     )
     parser.add_argument(
         "--root",
@@ -332,9 +349,317 @@ def main(argv: list[str] | None = None) -> None:
         if args.stage == "features":
             return
 
-    if args.stage in ("train", "all"):
-        print("[run_train] Stage 'train' not yet implemented (Milestone 7).")
-        if args.stage == "train":
+def run_model_stage(
+    root: Path,
+    sample: int | None = None,
+    max_pairs: int | None = None,
+    run_id: str | None = None,
+    val_ratio: float = 0.1,
+    threshold: float = 0.5,
+    force_mine: bool = False,
+) -> Dict[str, Any]:
+    """Execute Stage 3: LightGBM training with hard-negative mining and validation evaluation."""
+    import gc
+    import json
+    from business_entity_resolution.io_utils import load_config, load_ground_truth, load_source
+    from business_entity_resolution.model import (
+        DEFAULT_FEATURE_COLUMNS,
+        build_classifier,
+        evaluate_validation,
+        get_peak_memory_mb,
+        load_model,
+        mine_hard_negatives_and_prepare_datasets,
+        save_model,
+        stratified_entity_split,
+        train,
+    )
+    from business_entity_resolution.scoring import load_matches_dict
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    t_stage_start = time.time()
+    cfg_dir = root / "code" / "business_entity_resolution" / "configs"
+    model_cfg = load_config(cfg_dir / "model.yaml")["lgbm"]
+    paths_cfg = load_config(cfg_dir / "paths.yaml")
+
+    feat_india = root / "output" / "features_india_full.parquet"
+    feat_us = root / "output" / "features_us_full.parquet"
+    if not feat_india.is_file() or not feat_us.is_file():
+        raise FileNotFoundError(
+            f"Required feature parquet files not found! Checked: {feat_india} and {feat_us}"
+        )
+
+    print("\n" + "=" * 60)
+    print("STAGE 3: LIGHTGBM MODEL TRAINING & VALIDATION")
+    print("=" * 60)
+    print(f"Features India: {feat_india} ({feat_india.stat().st_size / (1024**3):.2f} GB)")
+    print(f"Features US:    {feat_us} ({feat_us.stat().st_size / (1024**3):.2f} GB)")
+    print(f"Validation Ratio: {val_ratio * 100:.1f}% (stratified by country + singleton)")
+    print(f"Decision Threshold: {threshold}")
+    print(f"Peak RAM at startup: {get_peak_memory_mb():.1f} MB")
+    print("-" * 60)
+
+    # ── Load ground truth & S1 metadata ─────────────────────────────
+    gt_path = root / paths_cfg["data"]["train"]["ground_truth"]
+    s1_path = root / paths_cfg["data"]["train"]["source1"]
+    gt_dict = load_matches_dict(gt_path)
+    s1 = load_source(s1_path, expected_source=1)
+    s1_country_map = dict(zip(s1["entity_id"], s1["country"]))
+    s1_ids = list(s1["entity_id"])
+
+    if sample is not None and sample > 0:
+        s1_ids = s1_ids[:sample]
+        s1_country_map = {k: s1_country_map[k] for k in s1_ids}
+        gt_dict = {k: gt_dict.get(k, set()) for k in s1_ids}
+        print(f"[model] Sampled to first {len(s1_ids):,} Source 1 entities")
+
+    # ── Stratified entity split ──────────────────────────────────────
+    ckpt_dir = root / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    val_entity_file = ckpt_dir / "val_entity_ids.json"
+
+    if val_entity_file.is_file() and not force_mine and sample is None:
+        val_entities = set(json.loads(val_entity_file.read_text(encoding="utf-8")))
+        train_entities = set(s1_ids) - val_entities
+        print(f"[model] Loaded {len(val_entities):,} held-out validation entities from {val_entity_file.name}")
+    else:
+        train_entities, val_entities = stratified_entity_split(
+            s1_ids=s1_ids,
+            s1_country_map=s1_country_map,
+            gt_dict=gt_dict,
+            val_ratio=val_ratio,
+            random_state=42,
+        )
+        if sample is None:
+            val_entity_file.write_text(json.dumps(sorted(val_entities)), encoding="utf-8")
+        print(f"[model] Created stratified split: {len(train_entities):,} train entities, {len(val_entities):,} val entities")
+
+    train_parquet = ckpt_dir / "train_mined.parquet"
+    val_candidates_parquet = ckpt_dir / "val_candidates.parquet"
+    val_mined_parquet = ckpt_dir / "val_mined.parquet"
+
+    # ── Hard-negative mining / dataset preparation ──────────────────
+    if (
+        train_parquet.is_file()
+        and val_candidates_parquet.is_file()
+        and not force_mine
+        and sample is None
+        and max_pairs is None
+    ):
+        print(
+            f"[model] Using existing mined datasets:\n"
+            f"  Train: {train_parquet} ({train_parquet.stat().st_size / (1024**2):.1f} MB)\n"
+            f"  Val:   {val_candidates_parquet} ({val_candidates_parquet.stat().st_size / (1024**2):.1f} MB)"
+        )
+    else:
+        print("[model] Streaming 440M candidate pairs and mining hard negatives...")
+        mine_stats = mine_hard_negatives_and_prepare_datasets(
+            feature_paths=[feat_india, feat_us],
+            gt_dict=gt_dict,
+            train_entities=train_entities,
+            val_entities=val_entities,
+            output_train_parquet=train_parquet,
+            output_val_candidates_parquet=val_candidates_parquet,
+            output_val_mined_parquet=val_mined_parquet,
+            feature_columns=DEFAULT_FEATURE_COLUMNS,
+            max_pairs=max_pairs,
+        )
+        print(
+            f"[model] Mining complete: {mine_stats['total_train_rows']:,} train rows "
+            f"({mine_stats['total_train_pos']:,} pos, {mine_stats['total_train_neg']:,} neg, ratio={mine_stats['train_imbalance_ratio']:.2f}) | "
+            f"Val candidates: {mine_stats['total_val_candidates']:,} | "
+            f"Elapsed: {mine_stats['elapsed_seconds']:.1f}s | Peak RAM: {mine_stats['peak_memory_mb']:.1f} MB"
+        )
+
+    # ── Load training data into memory ──────────────────────────────
+    print(f"\n[model] Loading training set into memory (Peak RAM before load: {get_peak_memory_mb():.1f} MB)...")
+    train_tbl = pq.read_table(train_parquet, columns=["label"] + DEFAULT_FEATURE_COLUMNS)
+    y_train = train_tbl["label"].to_numpy(zero_copy_only=False).astype(np.int8)
+    X_train = np.column_stack([
+        train_tbl[col].to_numpy(zero_copy_only=False) for col in DEFAULT_FEATURE_COLUMNS
+    ]).astype(np.float32)
+    del train_tbl
+    gc.collect()
+
+    n_pos = int(np.sum(y_train == 1))
+    n_neg = int(np.sum(y_train == 0))
+    scale_pos_weight = (n_neg / n_pos) if n_pos > 0 else 1.0
+    print(
+        f"[model] Loaded X_train: {X_train.shape} ({X_train.nbytes / (1024**2):.1f} MB) | "
+        f"Positives: {n_pos:,} | Negatives: {n_neg:,} | scale_pos_weight: {scale_pos_weight:.2f} | "
+        f"Peak RAM: {get_peak_memory_mb():.1f} MB"
+    )
+
+    X_val_eval, y_val_eval = None, None
+    if val_mined_parquet.is_file():
+        val_mined_tbl = pq.read_table(val_mined_parquet, columns=["label"] + DEFAULT_FEATURE_COLUMNS)
+        y_val_eval = val_mined_tbl["label"].to_numpy(zero_copy_only=False).astype(np.int8)
+        X_val_eval = np.column_stack([
+            val_mined_tbl[col].to_numpy(zero_copy_only=False) for col in DEFAULT_FEATURE_COLUMNS
+        ]).astype(np.float32)
+        del val_mined_tbl
+        gc.collect()
+        print(f"[model] Loaded validation monitoring set: {X_val_eval.shape} ({X_val_eval.nbytes / (1024**2):.1f} MB)")
+
+    # ── Train LightGBM model ─────────────────────────────────────────
+    print(f"\n[model] Training LightGBM classifier ({model_cfg.get('n_estimators', 500)} trees)...")
+    clf = build_classifier(model_cfg, scale_pos_weight=scale_pos_weight)
+    t_train_start = time.time()
+    clf = train(
+        clf,
+        X_train,
+        y_train,
+        X_val=X_val_eval,
+        y_val=y_val_eval,
+        early_stopping_rounds=50,
+        verbose_eval=50,
+    )
+    train_elapsed = time.time() - t_train_start
+    best_iter = getattr(clf, "best_iteration_", model_cfg.get("n_estimators", 500))
+    print(
+        f"[model] Training finished in {train_elapsed:.2f}s ({train_elapsed / 60.0:.2f}m) | "
+        f"Best iteration: {best_iter} | Peak RAM: {get_peak_memory_mb():.1f} MB"
+    )
+
+    # ── Persist model ────────────────────────────────────────────────
+    ckpt_model_txt = ckpt_dir / "lgbm_model.txt"
+    ckpt_model_pkl = ckpt_dir / "lgbm_model.pkl"
+    save_model(clf, ckpt_model_txt)
+    save_model(clf, ckpt_model_pkl)
+
+    models_dir = root / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    save_model(clf, models_dir / "lgbm_entity_model.txt")
+    print(f"[model] Model saved to {ckpt_model_txt} and {models_dir / 'lgbm_entity_model.txt'}")
+
+    # Free training matrices before validation evaluation
+    del X_train, y_train, X_val_eval, y_val_eval
+    gc.collect()
+
+    # ── Validation evaluation ────────────────────────────────────────
+    val_gt = {eid: gt_dict[eid] for eid in val_entities}
+    print(
+        f"\n[model] Scoring held-out validation set ({len(val_entities):,} entities) "
+        f"at naive baseline threshold = {threshold}..."
+    )
+    eval_metrics = evaluate_validation(
+        clf=clf,
+        val_candidates_path=val_candidates_parquet,
+        val_gt=val_gt,
+        s1_country_map=s1_country_map,
+        feature_columns=DEFAULT_FEATURE_COLUMNS,
+        threshold=threshold,
+    )
+
+    stage_elapsed = time.time() - t_stage_start
+    peak_ram_final = get_peak_memory_mb()
+
+    # ── Experiments logging ──────────────────────────────────────────
+    exp_id = run_id or f"run_{int(time.time())}"
+    exp_dir = root / "experiments" / exp_id
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    metrics_file = exp_dir / "metrics.json"
+
+    report = {
+        "run_id": exp_id,
+        "stage": "model",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "training": {
+            "n_train_rows": int(n_pos + n_neg),
+            "n_train_pos": n_pos,
+            "n_train_neg": n_neg,
+            "scale_pos_weight": float(scale_pos_weight),
+            "best_iteration": int(best_iter) if best_iter is not None else None,
+            "training_elapsed_seconds": train_elapsed,
+            "total_stage_seconds": stage_elapsed,
+            "peak_memory_mb": peak_ram_final,
+        },
+        "validation": eval_metrics,
+    }
+    metrics_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"[model] Experiment metrics logged to {metrics_file}")
+
+    # ── Print comprehensive evaluation table ─────────────────────────
+    print("\n" + "=" * 60)
+    print("LIGHTGBM MODEL EVALUATION REPORT (NAIVE THRESHOLD 0.5)")
+    print("=" * 60)
+    print(f"Overall Macro F_0.5:   {eval_metrics['macro_f_beta']:.4f}")
+    print(f"Singleton Mean:        {eval_metrics['singleton_mean']:.4f} ({eval_metrics['n_singletons']:,} entities)")
+    print(f"Has-Match Mean:        {eval_metrics['has_match_mean']:.4f} ({eval_metrics['n_has_match']:,} entities)")
+    print(f"Total Val Entities:    {eval_metrics['n_entities']:,}")
+    print(f"Val Pairs Scored:      {eval_metrics['val_pairs_scored']:,}")
+    if "india" in eval_metrics:
+        print("-" * 60)
+        print(f"India Macro F_0.5:     {eval_metrics['india']['macro_f_beta']:.4f}")
+        print(f"  India Singleton Mean: {eval_metrics['india']['singleton_mean']:.4f}")
+        print(f"  India Has-Match Mean: {eval_metrics['india']['has_match_mean']:.4f}")
+    if "us" in eval_metrics:
+        print(f"US Macro F_0.5:        {eval_metrics['us']['macro_f_beta']:.4f}")
+        print(f"  US Singleton Mean:    {eval_metrics['us']['singleton_mean']:.4f}")
+        print(f"  US Has-Match Mean:    {eval_metrics['us']['has_match_mean']:.4f}")
+    print("-" * 60)
+    print(f"Training Time:         {train_elapsed:.2f} s ({train_elapsed / 60.0:.2f} min)")
+    print(f"Total Stage Time:      {stage_elapsed:.2f} s ({stage_elapsed / 60.0:.2f} min)")
+    print(f"Peak Working Set RAM:  {peak_ram_final:.1f} MB")
+    print("=" * 60 + "\n")
+
+    if eval_metrics["macro_f_beta"] < 0.5:
+        logger.error(
+            f"Validation macro F_0.5 ({eval_metrics['macro_f_beta']:.4f}) is surprisingly low (< 0.50)! "
+            f"Stopping for investigation before proceeding."
+        )
+
+    return report
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Entry-point for the training pipeline."""
+    args = parse_args(argv)
+    print(f"[run_train] root = {args.root}")
+    print(f"[run_train] stage = {args.stage}")
+    if args.country:
+        print(f"[run_train] country = {args.country}")
+    if args.sample:
+        print(f"[run_train] sample = {args.sample}")
+    if args.max_pairs:
+        print(f"[run_train] max_pairs = {args.max_pairs}")
+    if args.run_id:
+        print(f"[run_train] run_id = {args.run_id}")
+
+    # Add src to sys.path so package imports resolve cleanly
+    src_dir = args.root / "code" / "business_entity_resolution" / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+
+    if args.stage in ("blocking", "all"):
+        run_blocking_stage(args.root, sample=args.sample, run_id=args.run_id)
+        if args.stage == "blocking":
+            return
+
+    if args.stage in ("features", "all"):
+        run_features_stage(
+            root=args.root,
+            country=args.country,
+            max_pairs=args.max_pairs,
+            chunk_size=args.chunk_size,
+            output_path=args.output,
+            candidate_pairs_path=args.candidate_pairs_path,
+            run_id=args.run_id,
+        )
+        if args.stage == "features":
+            return
+
+    if args.stage in ("train", "model", "all"):
+        run_model_stage(
+            root=args.root,
+            sample=args.sample,
+            max_pairs=args.max_pairs,
+            run_id=args.run_id,
+            val_ratio=args.val_ratio,
+            threshold=args.threshold,
+            force_mine=args.force_mine,
+        )
+        if args.stage in ("train", "model"):
             return
 
     if args.stage in ("eval", "all"):
