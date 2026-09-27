@@ -485,8 +485,8 @@ def _query_partition_candidates(
     addr_enabled: bool = True,
     prefix_len: int = 3,
     max_candidates: int = 100,
-    ref_lookup_name: Optional[Dict[str, str]] = None,
-    ref_lookup_addr: Optional[Dict[str, str]] = None,
+    ref_lookup_name: Optional[Dict[str, Tuple[str, ...]]] = None,
+    ref_lookup_addr: Optional[Dict[str, Tuple[str, ...]]] = None,
     country: Optional[str] = None,
 ) -> Dict[str, List[str]]:
     """Query candidates for each S1 entity in the partition.
@@ -615,19 +615,22 @@ def _query_partition_candidates(
                 # Stage 2: Jaccard re-scoring within pool
                 n_tokens = set(n.split()) if n else set()
                 a_tokens = set(a.split()) if a else set()
+                len_n = len(n_tokens)
+                len_a = len(a_tokens)
 
                 fine_scores: Dict[str, float] = {}
                 for c in pool:
-                    c_n = ref_lookup_name.get(c, "")
-                    c_a = ref_lookup_addr.get(c, "")
+                    c_n_tokens = ref_lookup_name.get(c, ()) if ref_lookup_name is not None else ()
+                    c_a_tokens = ref_lookup_addr.get(c, ()) if ref_lookup_addr is not None else ()
 
-                    c_n_tokens = set(c_n.split()) if c_n else set()
-                    c_a_tokens = set(c_a.split()) if c_a else set()
+                    n_inter = len(n_tokens.intersection(c_n_tokens))
+                    a_inter = len(a_tokens.intersection(c_a_tokens))
 
-                    n_union = len(n_tokens | c_n_tokens)
-                    a_union = len(a_tokens | c_a_tokens)
-                    n_sim = len(n_tokens & c_n_tokens) / n_union if n_union else 0.0
-                    a_sim = len(a_tokens & c_a_tokens) / a_union if a_union else 0.0
+                    n_union = len_n + len(c_n_tokens) - n_inter
+                    a_union = len_a + len(c_a_tokens) - a_inter
+
+                    n_sim = n_inter / n_union if n_union else 0.0
+                    a_sim = a_inter / a_union if a_union else 0.0
 
                     fine_scores[c] = scores[c] + (n_sim * 0.6) + (a_sim * 0.4)
 
@@ -828,8 +831,8 @@ def generate_candidate_pairs(
                     len(indices[0]), len(indices[1]), len(indices[2]), len(indices[3]))
 
         # Keep ref_names and ref_addrs for post-retrieval re-scoring
-        ref_lookup_name = {eid: n for eid, n in zip(ref_eids, ref_names)}
-        ref_lookup_addr = {eid: a for eid, a in zip(ref_eids, ref_addrs)}
+        ref_lookup_name = {eid: tuple(n.split()) if n else () for eid, n in zip(ref_eids, ref_names)}
+        ref_lookup_addr = {eid: tuple(a.split()) if a else () for eid, a in zip(ref_eids, ref_addrs)}
         del ref_eids, ref_names, ref_addrs
         gc.collect()
 

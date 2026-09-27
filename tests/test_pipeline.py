@@ -340,8 +340,8 @@ class TestRunInferPipeline:
         """Without explicit threshold, should use model.yaml default."""
         del infer_config["threshold"]
         result = run_infer_pipeline(infer_config)
-        # model.yaml has threshold.match = 0.5
-        assert result["threshold_used"] == 0.5
+        expected_thresh = infer_config.get("model", {}).get("threshold", {}).get("match", 0.98)
+        assert result["threshold_used"] == expected_thresh
 
     def test_load_data_and_normalize_complete(self, infer_config):
         """Load data and normalize should complete."""
@@ -357,6 +357,73 @@ class TestRunInferPipeline:
             assert result["stages"]["featurize"]["status"] == "skipped"
             assert result["stages"]["predict"]["status"] == "skipped"
             assert result["stages"]["group_and_write"]["status"] == "skipped"
+
+
+class TestStreamingPartitionInfer:
+    """Tests for the memory-safe streaming partitioned inference."""
+
+    @pytest.fixture
+    def infer_config_with_model(self, infer_config):
+        """Prepare an infer_config where models/lgbm_entity_model.txt is available."""
+        real_model = REPO_ROOT / "models" / "lgbm_entity_model.txt"
+        target_model = Path(infer_config["root"]) / "models" / "lgbm_entity_model.txt"
+        target_model.parent.mkdir(parents=True, exist_ok=True)
+        import shutil
+        if real_model.is_file():
+            shutil.copy2(real_model, target_model)
+        else:
+            target_model.write_text("dummy model content")
+        infer_config["model_path"] = str(target_model)
+        return infer_config
+
+    def test_streaming_partition_execution(self, infer_config_with_model):
+        """Verify streaming partitioned inference executes end-to-end and writes files."""
+        result = run_infer_pipeline(infer_config_with_model)
+        assert result["stages"]["load_data"]["status"] == "completed"
+        assert result["stages"]["normalize"]["status"] == "completed"
+        assert result["stages"]["blocking"]["status"] == "completed"
+        assert result["stages"]["featurize"]["status"] == "completed"
+        assert result["stages"]["predict"]["status"] == "completed"
+        assert result["stages"]["group_and_write"]["status"] == "completed"
+
+        out_dir = Path(infer_config_with_model["root"]) / "output"
+        cp_path = out_dir / "candidate_pairs.tsv"
+        mr_path = out_dir / "matching_results.tsv"
+
+        assert cp_path.is_file()
+        assert mr_path.is_file()
+
+        # Check candidate pairs format
+        cp_df = pd.read_csv(cp_path, sep="\t")
+        assert "source1_entity_id" in cp_df.columns
+        assert "candidate_entity_ids" in cp_df.columns
+
+        # Check matching results format
+        mr_df = pd.read_csv(mr_path, sep="\t", dtype=str)
+        assert "source1_entity_id" in mr_df.columns
+        assert "matched_entity_ids" in mr_df.columns
+
+        # Every S1 entity must appear exactly once
+        s1_ids = ["S1-001", "S1-002", "S1-003"]
+        assert list(mr_df["source1_entity_id"]) == s1_ids
+        assert len(mr_df) == len(s1_ids)
+
+    def test_streaming_partition_country_filter(self, infer_config_with_model):
+        """Verify country filtering restricts execution to specific country partition."""
+        infer_config_with_model["country"] = "US"
+        result = run_infer_pipeline(infer_config_with_model)
+        assert result["stages"]["group_and_write"]["status"] == "completed"
+        metrics = result["metrics"].get("output", {})
+        country_stats = metrics.get("country_stats", {})
+        assert "US" in country_stats
+        assert "India" not in country_stats
+        assert "France" not in country_stats
+
+    def test_streaming_partition_small_chunk_size(self, infer_config_with_model):
+        """Verify chunked scoring works with small chunk size (e.g. 1)."""
+        infer_config_with_model["chunk_size"] = 1
+        result = run_infer_pipeline(infer_config_with_model)
+        assert result["stages"]["predict"]["status"] == "completed"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

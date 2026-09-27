@@ -250,7 +250,6 @@ def run_blocking_stage(
     }
 
 
-<<<<<<< HEAD
 def run_features_stage(
     root: Path,
     country: str | None = None,

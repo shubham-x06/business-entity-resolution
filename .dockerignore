@@ -1,0 +1,12 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.venv
+venv
+dataset/
+output/
+checkpoints/
+experiments/
+*.zip
