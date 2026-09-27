@@ -69,8 +69,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.5,
-        help="Classification probability threshold for validation evaluation. Default: 0.5.",
+        default=0.98,
+        help="Classification probability threshold for validation evaluation. Default: 0.98.",
     )
     parser.add_argument(
         "--force-mine",
@@ -355,7 +355,7 @@ def run_model_stage(
     max_pairs: int | None = None,
     run_id: str | None = None,
     val_ratio: float = 0.1,
-    threshold: float = 0.5,
+    threshold: float = 0.98,
     force_mine: bool = False,
 ) -> Dict[str, Any]:
     """Execute Stage 3: LightGBM training with hard-negative mining and validation evaluation."""
@@ -434,9 +434,9 @@ def run_model_stage(
             val_entity_file.write_text(json.dumps(sorted(val_entities)), encoding="utf-8")
         print(f"[model] Created stratified split: {len(train_entities):,} train entities, {len(val_entities):,} val entities")
 
-    train_parquet = ckpt_dir / "train_mined.parquet"
+    train_parquet = ckpt_dir / "train_mined_cap40.parquet" if (ckpt_dir / "train_mined_cap40.parquet").is_file() else (ckpt_dir / "train_mined.parquet")
     val_candidates_parquet = ckpt_dir / "val_candidates.parquet"
-    val_mined_parquet = ckpt_dir / "val_mined.parquet"
+    val_mined_parquet = ckpt_dir / "val_mined_cap40.parquet" if (ckpt_dir / "val_mined_cap40.parquet").is_file() else (ckpt_dir / "val_mined.parquet")
 
     # ── Hard-negative mining / dataset preparation ──────────────────
     if (
@@ -483,10 +483,10 @@ def run_model_stage(
 
     n_pos = int(np.sum(y_train == 1))
     n_neg = int(np.sum(y_train == 0))
-    scale_pos_weight = (n_neg / n_pos) if n_pos > 0 else 1.0
+    scale_pos_weight = 1.0
     print(
         f"[model] Loaded X_train: {X_train.shape} ({X_train.nbytes / (1024**2):.1f} MB) | "
-        f"Positives: {n_pos:,} | Negatives: {n_neg:,} | scale_pos_weight: {scale_pos_weight:.2f} | "
+        f"Positives: {n_pos:,} | Negatives: {n_neg:,} | scale_pos_weight: {scale_pos_weight:.2f} (unweighted) | "
         f"Peak RAM: {get_peak_memory_mb():.1f} MB"
     )
 

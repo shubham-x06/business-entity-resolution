@@ -17,7 +17,7 @@ lgbm:
   class_weight: "balanced"
 
 threshold:
-  match: 0.5              # Probability threshold for declaring a match
+  match: 0.98             # Calibrated probability threshold maximizing macro F_0.5 (0.6365)
 
 validation:
   test_size: 0.2

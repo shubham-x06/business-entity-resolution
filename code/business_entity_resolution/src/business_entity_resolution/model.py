@@ -149,10 +149,10 @@ def mine_hard_negatives_and_prepare_datasets(
     output_val_candidates_parquet: Path,
     output_val_mined_parquet: Optional[Path] = None,
     feature_columns: Optional[List[str]] = None,
-    neg_pos_ratio: int = 5,
-    max_negatives_has_match: int = 15,
-    min_negatives_has_match: int = 5,
-    singleton_negatives: int = 10,
+    neg_pos_ratio: int = 10,
+    max_negatives_has_match: int = 40,
+    min_negatives_has_match: int = 10,
+    singleton_negatives: int = 35,
     batch_row_groups: int = 5,
     max_pairs: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -483,7 +483,7 @@ def evaluate_validation(
     val_gt: Dict[str, Set[str]],
     s1_country_map: Optional[Dict[str, str]] = None,
     feature_columns: Optional[List[str]] = None,
-    threshold: float = 0.5,
+    threshold: float = 0.98,
     batch_size: int = 500000,
 ) -> Dict[str, Any]:
     """Score the held-out validation set using official macro_f_beta.
